@@ -21,6 +21,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run the poller
         env:
           BASE44_APP_ID: ${{ secrets.BASE44_APP_ID }}
