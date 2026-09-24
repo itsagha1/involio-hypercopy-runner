@@ -1,0 +1,30 @@
+name: Involio delta poll (demo)
+
+# GitHub Actions trial runner.
+# Polls Involio on a schedule, writes deltas to Base44, fires the VPS webhook.
+# NOTE: GitHub cron minimum is every 5 minutes, but scheduled runs can be
+# delayed by a few minutes when GitHub is busy.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch: {}      # manual "Run workflow" button for testing
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the poller
+        env:
+          BASE44_APP_ID: ${{ secrets.BASE44_APP_ID }}
+          BASE44_API_KEY: ${{ secrets.BASE44_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.VPS_WEBHOOK_URL }}
+          WEBHOOK_SHARED_SECRET: ${{ secrets.WEBHOOK_SHARED_SECRET }}
+        run: python poll_involio.py
