@@ -1,4 +1,4 @@
-name: Involio delta poll (demo)
+name: Involio delta poll (fallback)
 
 # GitHub Actions trial runner.
 # Polls Involio on a schedule, writes deltas to Base44, fires the VPS webhook.

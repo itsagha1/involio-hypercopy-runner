@@ -1,132 +1,154 @@
 """
-Involio→HyperCopy webhook listener (DEMO MODE)
+Involio -> Bybit HyperCopy VPS listener (REAL DATA, DRY_RUN by default)
 
-Runs on your VPS (or PC/Termux). Receives webhook POSTs from the Base44
-polling function whenever an Involio delta is detected, runs the trade
-management logic, and reports the action back to Base44.
+Receives webhook POSTs from the Base44 `pollInvolioDeltas` function whenever an
+Involio trader position shows activity. Keeps the last-known books, computes
+exact deltas, and applies the manage-only copybot rules.
 
-DEMO MODE: no real Hyperliquid calls are made. Actions are only logged
-and written back to the InvolioDelta entity. Flip DRY_RUN=False once
-real credentials are in place.
+MANAGE-ONLY RULES (owner directive 2026-09-22):
+  - NEW INVOLIO ENTRIES ARE PAUSED. No new symbols, no side flips.
+  - Only manage positions that are ALREADY OPEN on Bybit sub-account
+    AIsub587820763 at run start. Absent symbol/side -> skip, log
+    new_entries_paused.
+  - NEVER realize a loss: when the source drops a position, close only if
+    unrealisedPnl is comfortably positive; otherwise set a Bybit trailing
+    stop (activation avgPrice x1.015 long / x0.985 short, distance 1%).
+  - Sizing base = full sub-account equity per trader, max_trade 50 USDT,
+    min 2 USDT.
 
-Setup (on VPS):
-    python3 -m venv venv && source venv/bin/activate
-    pip install -r requirements.txt
+DRY_RUN=True (default): no Bybit orders are placed; every planned action is
+logged to actions.log and to the console. Bybit keys live only in the local
+.env on the VPS - never in Base44.
+
+Run:
     uvicorn listener:app --host 127.0.0.1 --port 8000
-
-Behind Cloudflare Tunnel (recommended, no open ports):
-    cloudflared tunnel --url http://127.0.0.1:8000
 """
 
-import hashlib
 import hmac
+import json
 import os
-import time
+from datetime import datetime, timezone
 
-import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-DRY_RUN = True  # <-- demo mode. No real orders will ever be placed while True.
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+SHARED_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET", "")
+STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
+LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
-SHARED_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET", "demo-secret-change-me")
-BASE44_APP_ID = os.environ.get("BASE44_APP_ID", "")   # fill in after deploy
-BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "") # fill in after deploy
-DEMO_LOG = "demo_actions.log"
-
-app = FastAPI(title="Involio Delta Listener (demo)")
+app = FastAPI(title="Involio HyperCopy Listener")
 
 
-class Delta(BaseModel):
-    delta_id: str           # Base44 InvolioDelta record id
-    profile: str            # limpan96 / akira / nathanbrown
-    profile_label: str      # Scalping / Crypto / The Bakery
-    delta_type: str         # new_trade / size_change / close / ...
-    coin: str | None = None
-    side: str | None = None
-    size: float | None = None
-    price: float | None = None
-    value_usd: float | None = None
-    payload: str = ""       # raw JSON
+class WebhookPayload(BaseModel):
+    source: str
+    fired_at: str
+    recents: dict = {}
+    books: dict
 
 
-def verify_signature(raw_body: bytes, signature: str | None) -> None:
-    """Ensure the request really came from your Base44 function."""
-    if not signature:
-        raise HTTPException(status_code=401, detail="Missing signature")
-    expected = hmac.new(
-        SHARED_SECRET.encode(), raw_body, hashlib.sha256
-    ).hexdigest()
-    if not hmac.compare_digest(expected, signature or ""):
-        raise HTTPException(status_code=401, detail="Bad signature")
+def log_action(line: str) -> None:
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    entry = f"[{stamp}] {line}"
+    print(entry, flush=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(entry + "\n")
 
 
-def manage_trade(delta: Delta) -> str:
-    """
-    DEMO trade-management logic. Replace with real Hyperliquid calls later.
-
-    This is where the heavy/smart work lives - the part we do NOT want
-    Base44 to burn credits on.
-    """
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    if delta.delta_type == "new_trade":
-        action = (
-            f"[SIMULATED] Open {delta.side} {delta.size} {delta.coin} "
-            f"@ {delta.price} for {delta.profile} ({delta.profile_label})"
-        )
-    elif delta.delta_type == "size_change":
-        action = f"[SIMULATED] Resize {delta.coin} position for {delta.profile}"
-    elif delta.delta_type == "close":
-        action = f"[SIMULATED] Close {delta.coin} position for {delta.profile}"
-    else:
-        action = f"[SIMULATED] No-op for delta type {delta.delta_type}"
-
-    line = f"{ts} | {action}"
-    print(line)
-    with open(DEMO_LOG, "a") as f:
-        f.write(line + "\n")
-    return action
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"books": {}, "last_webhook": None}
 
 
-def report_back(delta: Delta, action: str) -> None:
-    """Tell Base44 what we did, so the DB keeps the full story."""
-    if not (BASE44_APP_ID and BASE44_API_KEY):
-        print("(demo) would report back:", delta.delta_id, "->", action)
-        return
-    url = (
-        f"https://api.base44.com/apps/{BASE44_APP_ID}/"
-        f"backend/functions/reportDeltaAction"
-    )
-    try:
-        requests.post(
-            url,
-            json={"delta_id": delta.delta_id, "action_taken": action},
-            headers={"api_key": BASE44_API_KEY},
-            timeout=10,
-        )
-    except Exception as exc:  # network hiccup should not kill the listener
-        print("report_back failed:", exc)
+def save_state(state: dict) -> None:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+    os.replace(tmp, STATE_FILE)
+
+
+def compute_deltas(prev_books: dict, books: dict) -> list:
+    """Diff two book snapshots per trader -> list of delta dicts."""
+    deltas = []
+    for trader, book in books.items():
+        prev = {p["ticker"] + "/" + p["side"]: p for p in prev_books.get(trader, {}).get("positions", [])}
+        curr_keys = set()
+        for p in book.get("positions", []):
+            key = p["ticker"] + "/" + p["side"]
+            curr_keys.add(key)
+            old = prev.get(key)
+            if old is None:
+                deltas.append({"trader": trader, "type": "new_entry", "position": p})
+            elif old.get("last_sim") != p.get("last_sim"):
+                kind = "size_add" if (p.get("last_sim") or 0) > (old.get("last_sim") or 0) else "size_reduce"
+                deltas.append({"trader": trader, "type": kind, "position": p})
+            elif old.get("stop_loss") != p.get("stop_loss") or old.get("price_target") != p.get("price_target"):
+                deltas.append({"trader": trader, "type": "sltp_change", "position": p})
+        for key, old in prev.items():
+            if key not in curr_keys:
+                deltas.append({"trader": trader, "type": "source_close", "position": old})
+    return deltas
+
+
+def evaluate(delta: dict, open_mirrors: set) -> str:
+    """Apply the manage-only rules. open_mirrors = set of 'TRADER/COIN/SIDE'
+    currently open on Bybit (filled by the Bybit poller once live)."""
+    p = delta["position"]
+    trader = delta["trader"]
+    key = f"{trader}/{p['ticker']}/{p['side']}"
+    t = delta["type"]
+    if t in ("new_entry", "size_add") and key not in open_mirrors:
+        return f"SKIP {key} {t}: new_entries_paused (no open mirror)"
+    if t in ("size_add", "size_reduce", "sltp_change"):
+        if key in open_mirrors:
+            return f"TODO {key} {t}: mirror size/SLTP sync (sizing: full equity/trader, max 50, min 2 USDT)"
+        return f"SKIP {key} {t}: no open mirror"
+    if t == "source_close":
+        if key in open_mirrors:
+            return (f"NO-LOSS RULE {key} source_close: close only if unrealisedPnl comfortably > 0; "
+                    "else set Bybit trailing stop (act = avgPrice x1.015 long / x0.985 short, dist 1%)")
+        return f"SKIP {key} source_close: no open mirror"
+    return f"UNKNOWN {key} {t}"
 
 
 @app.post("/webhook/involio-delta")
-async def involio_delta(
-    delta: Delta,
-    x_signature: str | None = Header(default=None),
-):
-    # NOTE: raw-body signature check happens in production; demo accepts
-    # the shared secret via header for simplicity during testing.
-    if x_signature != SHARED_SECRET and x_signature != hmac.new(
-        SHARED_SECRET.encode(), delta.model_dump_json().encode(), hashlib.sha256
-    ).hexdigest():
-        # In demo mode allow the plain secret; tighten this before prod.
-        if x_signature != SHARED_SECRET:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+async def involio_delta(payload: WebhookPayload, x_signature: str = Header(default="")):
+    if not SHARED_SECRET:
+        log_action("REJECT: WEBHOOK_SHARED_SECRET not set on VPS")
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, SHARED_SECRET):
+        log_action("REJECT: bad signature")
+        raise HTTPException(403, "bad signature")
 
-    action = manage_trade(delta)
-    report_back(delta, action)
-    return {"ok": True, "dry_run": DRY_RUN, "action": action}
+    state = load_state()
+    deltas = compute_deltas(state.get("books", {}), payload.books)
+
+    # Until Bybit polling is wired in, open_mirrors is empty: everything new
+    # is skipped under the new-entries-paused rule. When live, this set is
+    # loaded from the Bybit position list at the start of each run.
+    open_mirrors: set = set()
+
+    for d in deltas:
+        action = evaluate(d, open_mirrors)
+        log_action(f"DRY_RUN={DRY_RUN} :: {action}" if DRY_RUN else action)
+
+    state["books"] = payload.books
+    state["last_webhook"] = payload.fired_at
+    state["last_processed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    state["deltas_last_run"] = len(deltas)
+    save_state(state)
+    return {"ok": True, "deltas": len(deltas), "dry_run": DRY_RUN}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "dry_run": DRY_RUN, "uptime_mode": "demo"}
+    state = load_state()
+    return {
+        "ok": True,
+        "dry_run": DRY_RUN,
+        "traders": list(state.get("books", {}).keys()),
+        "last_webhook": state.get("last_webhook"),
+        "positions": {t: len(b.get("positions", [])) for t, b in state.get("books", {}).items()},
+    }
