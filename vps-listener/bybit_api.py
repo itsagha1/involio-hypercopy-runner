@@ -125,6 +125,17 @@ class BybitClient:
         except (KeyError, IndexError, TypeError, ValueError) as e:
             raise BybitError(f"could not parse wallet balance: {e}") from e
 
+    def get_available_balance(self, coin: str = "USDT") -> float:
+        res = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+        try:
+            acct = res["list"][0]
+            avail = float(acct.get("totalAvailableBalance") or 0)
+            if avail <= 0:
+                avail = float(acct["coin"][0].get("availableToWithdraw") or 0)
+            return avail
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            raise BybitError(f"could not parse available balance: {e}") from e
+
     def get_positions(self, symbol: str = None) -> list:
         params = {"category": "linear", "settleCoin": "USDT"}
         if symbol:
@@ -146,6 +157,36 @@ class BybitClient:
         if reduce_only:
             body["reduceOnly"] = True
         return self._post("/v5/order/create", body)
+
+    def set_leverage(self, symbol: str, leverage: int) -> dict:
+        body = {
+            "category": "linear",
+            "symbol": symbol,
+            "buyLeverage": f"{leverage}",
+            "sellLeverage": f"{leverage}",
+        }
+        try:
+            return self._post("/v5/position/set-leverage", body)
+        except BybitError as e:
+            if "110043" in str(e):   # leverage not modified = already correct
+                return {}
+            raise
+
+    def set_sl_tp(self, symbol: str, stop_loss, take_profit,
+                  position_idx: int = 0) -> dict:
+        """Sync source SL/TP (absolute prices) onto the Bybit position."""
+        body = {
+            "category": "linear",
+            "symbol": symbol,
+            "positionIdx": position_idx,
+        }
+        if stop_loss:
+            body["stopLoss"] = f"{stop_loss}"
+        if take_profit:
+            body["takeProfit"] = f"{take_profit}"
+        if "stopLoss" not in body and "takeProfit" not in body:
+            return {}
+        return self._post("/v5/position/set-trading-stop", body)
 
     def set_trailing_stop(self, symbol: str, active_price: float, distance_pct: float,
                           position_idx: int = 0) -> dict:
