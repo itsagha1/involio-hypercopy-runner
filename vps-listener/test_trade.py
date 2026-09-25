@@ -17,6 +17,8 @@ Usage (on the VPS):
 import argparse
 import time
 
+from bybit_api import BybitClient, BybitError, bybit_side, close_side, position_idx, round_qty
+
 
 def load_env(path: str = ".env") -> None:
     import os
@@ -42,7 +44,6 @@ def main() -> None:
     args = p.parse_args()
 
     load_env()
-    from bybit_api import BybitClient, BybitError, bybit_side, close_side, position_idx, round_qty
 
     client = BybitClient()
     if not client.configured:
