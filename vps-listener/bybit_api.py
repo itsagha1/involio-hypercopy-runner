@@ -4,8 +4,12 @@ Bybit v5 API client for the HyperCopy runner (sub-account keys only).
 - Keys live ONLY in vps-listener/.env on the VPS (never in Base44).
 - Bybit geo-blocks UAE IPs, so all calls go through the Webshare Spain
   proxy set in BYBIT_PROXY (format: http://user:pass@host:port).
-- Standard Bybit v5 HMAC signing: sign = HMAC_SHA256(secret,
-  timestamp + api_key + recvWindow + (queryString | rawBody)).
+- Two auth modes (auto-detected from .env):
+    HMAC (legacy): BYBIT_API_SECRET -> hex HMAC_SHA256(secret,
+        timestamp + api_key + recvWindow + (queryString | rawBody))
+    RSA (new Bybit flow): BYBIT_RSA_PRIVATE_KEY_FILE -> base64(RSA-SHA256
+        PKCS1v15 signature of the same payload). Generate the keypair ON the
+        VPS (openssl genrsa 4096) so the private key never leaves it.
 
 Manage-only rule details encoded here:
   - HYPE uses hedge-mode positionIdx: 1 long / 2 short; everything else 0.
@@ -28,9 +32,18 @@ class BybitError(Exception):
 
 
 class BybitClient:
-    def __init__(self, api_key=None, api_secret=None, proxy=None, testnet=False):
+    def __init__(self, api_key=None, api_secret=None, rsa_key_file=None,
+                 proxy=None, testnet=False):
         self.key = api_key or os.environ.get("BYBIT_API_KEY", "")
         self.secret = api_secret or os.environ.get("BYBIT_API_SECRET", "")
+        self.rsa_key = None
+        rsa_key_file = rsa_key_file or os.environ.get("BYBIT_RSA_PRIVATE_KEY_FILE", "")
+        if not self.secret and rsa_key_file:
+            with open(os.path.abspath(rsa_key_file), "rb") as f:
+                pem = f.read()
+            if b"PRIVATE KEY" in pem:
+                from cryptography.hazmat.primitives import serialization
+                self.rsa_key = serialization.load_pem_private_key(pem, password=None)
         proxy = proxy or os.environ.get("BYBIT_PROXY", "")
         self.base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.session = requests.Session()
@@ -40,11 +53,19 @@ class BybitClient:
 
     @property
     def configured(self) -> bool:
-        return bool(self.key and self.secret)
+        return bool(self.key and (self.secret or self.rsa_key))
 
     def _sign(self, ts: str, param_str: str) -> str:
-        msg = f"{ts}{self.key}{RECV_WINDOW}{param_str}"
-        return hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        msg = f"{ts}{self.key}{RECV_WINDOW}{param_str}".encode()
+        if self.secret:  # legacy HMAC
+            return hmac.new(self.secret.encode(), msg, hashlib.sha256).hexdigest()
+        # RSA-SHA256 PKCS1v15, base64-encoded (Bybit self-generated key flow)
+        import base64
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        return base64.b64encode(
+            self.rsa_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+        ).decode()
 
     def _check(self, data: dict, path: str) -> dict:
         if data.get("retCode") != 0:
