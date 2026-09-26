@@ -161,6 +161,11 @@ class BybitClient:
                 raise BybitError("position pagination did not terminate")
         return out
 
+    def get_order_history(self, symbol: str, limit: int = 50) -> list:
+        """Closed+open order history for a linear symbol (forensics)."""
+        params = {"category": "linear", "symbol": symbol, "limit": limit}
+        return self._get("/v5/order/history", params).get("list", [])
+
     # ---------- trading ----------
 
     def place_order(self, symbol: str, side: str, qty: float, position_idx: int = 0,

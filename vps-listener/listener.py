@@ -70,7 +70,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.0.0"   # bump on every deployed change; exposed in /status
+LISTENER_VERSION = "v3.1.0"   # bump on every deployed change; exposed in /status
 PNL_CLOSE_MIN_RATIO = 0.005      # no-loss: realize only if >= 0.5% of value
 PROFIT_SKIP_RATIO = 1.03         # rule 3: skip new trades already +3%
 SIZE_NOISE_BAND = (0.85, 1.15)   # sim/price wobble that is pure PnL
@@ -696,7 +696,9 @@ async def status():
                     {"symbol": p.get("symbol"), "side": p.get("side"),
                      "size": p.get("size"), "avgPrice": p.get("avgPrice"),
                      "unrealisedPnl": p.get("unrealisedPnl"),
-                     "leverage": p.get("leverage")}
+                     "leverage": p.get("leverage"),
+                     "createdTime": p.get("createdTime"),
+                     "updatedTime": p.get("updatedTime")}
                     for p in client.get_positions()
                     if p.get("size") not in ("0", 0, 0.0, None, "")
                 ],
@@ -711,3 +713,31 @@ async def status():
         except BybitError as e:
             out["bybit_error"] = str(e)
     return out
+
+
+@app.get("/log")
+async def log_endpoint(n: int = 300):
+    """Last n lines of actions.log - remote forensics (owner directive 2026-09-27)."""
+    n = max(1, min(int(n), 2000))
+    return {"ok": True, "code_version": LISTENER_VERSION, "lines": log_tail(n)}
+
+
+@app.get("/orders")
+async def orders(symbol: str, limit: int = 50):
+    """Bybit order history for one symbol - forensics (owner directive).
+    Market orders = listener or manual API; limit orders = manual UI trades."""
+    client = BybitClient()
+    if DRY_RUN or not client.configured:
+        return {"ok": False, "error": "bybit not configured"}
+    try:
+        rows = client.get_order_history(symbol, max(1, min(int(limit), 100)))
+        return {"ok": True, "code_version": LISTENER_VERSION, "symbol": symbol,
+                "orders": [{"time": o.get("createdTime"), "side": o.get("side"),
+                            "qty": o.get("qty"), "filled": o.get("cumExecQty"),
+                            "avgPrice": o.get("avgPrice"),
+                            "type": o.get("orderType"),
+                            "status": o.get("orderStatus"),
+                            "reduceOnly": o.get("reduceOnly")}
+                           for o in rows]}
+    except BybitError as e:
+        return {"ok": False, "error": str(e)}
