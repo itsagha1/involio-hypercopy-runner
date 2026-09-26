@@ -137,10 +137,29 @@ class BybitClient:
             raise BybitError(f"could not parse available balance: {e}") from e
 
     def get_positions(self, symbol: str = None) -> list:
-        params = {"category": "linear", "settleCoin": "USDT"}
+        """All linear USDT positions, following Bybit V5 pagination cursors.
+
+        CRITICAL: /v5/position/list returns at most `limit` rows per page
+        (default 20) plus nextPageCursor. Without pagination any position
+        beyond the first page looks "closed" to the caller, which previously
+        made the listener deregister live mirrors (orphan bug, 2026-09-26).
+        """
+        params = {"category": "linear", "settleCoin": "USDT", "limit": 200}
         if symbol:
             params["symbol"] = symbol
-        return self._get("/v5/position/list", params).get("list", [])
+        out, cursor, guard = [], "", 0
+        while True:
+            if cursor:
+                params["cursor"] = cursor
+            res = self._get("/v5/position/list", params)
+            out.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor") or ""
+            if not cursor:
+                break
+            guard += 1
+            if guard > 20:  # safety cap (~4000 positions)
+                raise BybitError("position pagination did not terminate")
+        return out
 
     # ---------- trading ----------
 

@@ -26,11 +26,15 @@ def ok(cond, label):
 
 
 class FakeClient:
-    def __init__(self, avail=500.0):
+    def __init__(self, avail=500.0, wallet=500.0):
         self.avail = avail
+        self.wallet = wallet
         self.orders = []
         self.stops = []
         self.lev = []
+
+    def get_balance(self, coin="USDT"):
+        return self.wallet
 
     @property
     def configured(self):
@@ -61,10 +65,11 @@ class FakeClient:
 
 
 def pos(ticker="SOL", side="short", es=3.85, ls=None, lev=20,
-        ep=120.0, cp=120.0, sl=None, tp=None):
+        ep=120.0, cp=120.0, sl=None, tp=None, created_at=None):
     return {"ticker": ticker, "side": side, "leverage": lev, "entry_price": ep,
             "current_price": cp, "stop_loss": sl, "price_target": tp,
-            "entry_sim": es, "last_sim": ls if ls is not None else es}
+            "entry_sim": es, "last_sim": ls if ls is not None else es,
+            "created_at": created_at}
 
 
 print("1. compute_deltas detects all four change types")
@@ -130,7 +135,7 @@ ok(abs(c.stops[-1][2] - 98.5) < 1e-9, "trail activation 0.985 x avg for short")
 print("9. webhook: fresh start baseline capture, then baseline is skipped")
 lp = listener.WebhookPayload(
     source="t", fired_at="2026-09-26T03:00:00Z", recents={},
-    books={"nathanbrown": {"positions": [pos(es=3.85)]}})
+    books={"nathanbrown": {"positions": [pos(es=3.85, created_at="2026-09-25T10:00:00Z")]}})
 res = asyncio.run(listener.involio_delta(lp, x_signature="testsecret"))
 st = json.load(open(os.environ["STATE_FILE"]))
 ok(res.get("fresh_start") and st["baseline"] == ["nathanbrown|SOL/short"], "baseline recorded")
@@ -138,12 +143,72 @@ ok(res.get("fresh_start") and st["baseline"] == ["nathanbrown|SOL/short"], "base
 print("10. webhook: baseline delta ignored, new non-baseline trade processed")
 lp2 = listener.WebhookPayload(
     source="t", fired_at="2026-09-26T03:05:00Z", recents={},
-    books={"nathanbrown": {"positions": [pos(es=3.85, ls=3.70), pos(ticker="XRP", es=2.99, lev=20, cp=1.58)]}})
+    books={"nathanbrown": {"positions": [pos(es=3.85, ls=3.70, created_at="2026-09-25T10:00:00Z"), pos(ticker="XRP", es=2.99, lev=20, cp=1.58, created_at="2026-09-26T02:00:00Z")]}})
 res2 = asyncio.run(listener.involio_delta(lp2, x_signature="testsecret"))
 log = open(os.environ["LOG_FILE"]).read()
 ok("SKIP nathanbrown|SOL/short" in log, "baseline delta skipped")
 ok("WOULD OPEN nathanbrown|XRP/short" in log, "new trade processed (dry-run logged)")
 ok(res2["ok"] and res2["deltas"] >= 1, "webhook ok")
+
+print("11. owner rule 2026-09-27: leverage capped at 20x")
+c_lev = FakeClient()
+txt, rec_lev = listener.open_mirror(c_lev, "akira", pos(ticker="DOGE", es=5.0, lev=50, cp=0.1))
+ok(rec_lev is not None and rec_lev["leverage"] == 20, "50x source opened at 20x cap")
+ok(c_lev.lev == [("DOGEUSDT", 20)], "set_leverage called with capped 20")
+
+print("12. owner rule: 70% margin cap blocks opens when budget exhausted")
+c_cap = FakeClient(avail=10.0, wallet=100.0)  # used=90, budget=70-90=-20
+txt, rec_cap = listener.open_mirror(c_cap, "akira", pos(ticker="DOGE", es=2.0, lev=10, cp=0.1))
+ok(rec_cap is None and "margin cap" in txt, f"cap reached skip: {txt}")
+
+print("13. owner rule: 70% cap scales down within budget")
+c_sc = FakeClient(avail=100.0, wallet=200.0)  # used=100, budget=140-100=40
+txt, rec_sc = listener.open_mirror(c_sc, "akira", pos(ticker="DOGE", es=50.0, lev=10, cp=1.0))
+ok(rec_sc is not None and "scaled down" in txt, f"scaled open: {txt}")
+ok(rec_sc["qty"] <= 40 * 10 + 1e-9, f"qty respects budget margin (qty={rec_sc['qty']})")
+
+print("14. owner rule: max 2 adds per trade")
+c_add = FakeClient()
+rec_add = {"symbol": "SOLUSDT", "side": "short", "qty": 0.64,
+           "their_qty": 0.64, "leverage": 20, "adds": 2}
+p_prev_add = pos(es=3.85, ls=3.85, cp=120.0)
+p_now_add = pos(es=3.85, ls=5.0, cp=120.0)
+txt = listener.sync_size(c_add, "nathanbrown", p_now_add, rec_add, p_prev_add)
+ok(txt.startswith("SKIP") and "add cap" in txt, f"3rd add skipped: {txt}")
+ok(not c_add.orders, "no order placed for capped add")
+
+print("15. owner rule: symbol uniqueness across profiles")
+mirrored = {"limpan96|HBAR/long": {"symbol": "HBARUSDT"},
+            "nathanbrown|XRP/long": {"symbol": "XRPUSDT"}}
+owners = listener.symbol_mirrored_by_others(mirrored, "nathanbrown", "HBAR")
+ok(owners == ["limpan96"], f"cross-profile conflict detected: {owners}")
+owners2 = listener.symbol_mirrored_by_others(mirrored, "limpan96", "HBAR")
+ok(owners2 == [], "same profile is not a conflict")
+
+print("16. baseline close+reopen (WLD bug): reopened position is un-baselined")
+fresh_state = {"baseline": ["nathanbrown|SOL/short"], "mirrored": {},
+               "books": {}, "manual": [], "manual_adopted": True,
+               "orphans": {}, "mismatches": {}, "dereg_pending": [],
+               "fresh_start_at": "2026-09-26T00:30:07+00:00"}
+ok(listener.is_reopened_position({"created_at": "2026-09-26T13:30:10.330Z"},
+                                "2026-09-26T00:30:07+00:00"), "newer created_at detected")
+ok(not listener.is_reopened_position({"created_at": "2026-09-25T10:00:00Z"},
+                                     "2026-09-26T00:30:07+00:00"), "older created_at stays baseline")
+ok(not listener.is_reopened_position({}, "2026-09-26T00:30:07+00:00"), "missing created_at is not a reopen")
+
+print("17. orphan + mismatch detection")
+state_det = {"mirrored": {"nathanbrown|SOL/short": {"qty": 10}},
+             "manual": ["WLD/short"]}
+live = {"SOL/short": {"size": "25", "avgPrice": "2.0"},   # mismatch: 10 tracked vs 25 live
+        "WLD/short": {"size": "100", "avgPrice": "0.5"},  # manual: ignored
+        "AVAX/short": {"size": "4", "avgPrice": "10"}}    # orphan
+orphans, mismatches = listener.detect_unmanaged(state_det, live)
+ok(orphans == [("AVAX/short", 4.0)], f"orphan found: {orphans}")
+ok(len(mismatches) == 1 and mismatches[0][0] == "SOL/short", f"mismatch found: {mismatches}")
+
+print("18. margin budget math")
+c_b = FakeClient(avail=40.0, wallet=100.0)   # used=60, budget=70-60=10
+ok(abs(listener.margin_budget(c_b) - 10.0) < 1e-9, "budget = 0.7*wallet - used")
 
 print("11. bad signature rejected")
 try:
