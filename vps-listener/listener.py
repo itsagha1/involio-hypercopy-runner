@@ -70,7 +70,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.1.0"   # bump on every deployed change; exposed in /status
+LISTENER_VERSION = "v3.2.0"   # bump on every deployed change; exposed in /status
 PNL_CLOSE_MIN_RATIO = 0.005      # no-loss: realize only if >= 0.5% of value
 PROFIT_SKIP_RATIO = 1.03         # rule 3: skip new trades already +3%
 SIZE_NOISE_BAND = (0.85, 1.15)   # sim/price wobble that is pure PnL
@@ -90,6 +90,7 @@ class WebhookPayload(BaseModel):
     fired_at: str
     recents: dict = {}
     books: dict
+    hold_new: bool = False   # owner directive: block NEW mirrors, keep managing
 
 
 # ---------------------------------------------------------------- helpers
@@ -462,6 +463,12 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                    f"Involio position(s) will NOT be mirrored: {baseline}")
         return {"ok": True, "fresh_start": True, "baseline": len(baseline)}
 
+    if state.get("hold_new") != bool(payload.hold_new):
+        state["hold_new"] = bool(payload.hold_new)
+        log_action(f"HOLD MODE {'ON' if payload.hold_new else 'OFF'}: new mirrors "
+                   f"{'blocked' if payload.hold_new else 'resumed'}, existing mirrors "
+                   f"keep being managed")
+
     prev_books = state.get("books", {})
     deltas = compute_deltas(prev_books, payload.books)
 
@@ -563,6 +570,10 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
             t = "new_entry"
 
         if t == "new_entry":
+            if payload.hold_new:
+                log_action(f"SKIP {k} new_entry: hold mode active "
+                           f"(owner directive: no new positions)")
+                continue
             if rec:
                 log_action(f"LOG {k} new_entry: mirror already exists")
                 continue
@@ -670,6 +681,7 @@ async def status():
         "ok": True,
         "mode": "full_mirror",
         "code_version": LISTENER_VERSION,
+        "hold_new": state.get("hold_new", False),
         "dry_run": DRY_RUN,
         "fresh_start_at": state.get("fresh_start_at"),
         "baseline_count": len(state.get("baseline", [])),
