@@ -136,6 +136,63 @@ class BybitClient:
         except (KeyError, IndexError, TypeError, ValueError) as e:
             raise BybitError(f"could not parse available balance: {e}") from e
 
+    def get_account_summary(self, coin: str = "USDT") -> dict:
+        """One call, all account-level figures Bybit's own UI uses.
+
+        walletBalance excludes floating (unrealised) PnL; Bybit's UI
+        "Margin Balance" = totalMarginBalance, which DOES include it
+        (roughly totalWalletBalance + totalPerpUPL). Reporting code must
+        use totalMarginBalance/totalPerpUPL to match what the owner sees
+        in the app - a bug fixed 2026-09-29 (previously only walletBalance
+        was read, understating how much floating losses had eaten into
+        the account)."""
+        res = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+        try:
+            acct = res["list"][0]
+        except (KeyError, IndexError, TypeError) as e:
+            raise BybitError(f"could not parse account summary: {e}") from e
+
+        def f(key, default=0.0):
+            v = acct.get(key)
+            try:
+                return float(v) if v not in (None, "") else default
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "wallet_balance": f("totalWalletBalance"),
+            "margin_balance": f("totalMarginBalance"),
+            "equity": f("totalEquity"),
+            "available_balance": f("totalAvailableBalance"),
+            "unrealised_pnl": f("totalPerpUPL"),
+            "initial_margin": f("totalInitialMargin"),
+            "maintenance_margin": f("totalMaintenanceMargin"),
+        }
+
+    def get_closed_pnl(self, start_time_ms: int, category: str = "linear") -> float:
+        """Sum of realised PnL for positions closed since start_time_ms.
+
+        Bybit's own "Cumulative P&L" on the Positions tab is realised
+        PnL from today's closed trades PLUS current unrealised PnL - not
+        just the live positions' floating PnL. Paginates via cursor,
+        capped at 10 pages (2000 rows) as a sane forensics limit."""
+        total, cursor, guard = 0.0, "", 0
+        while guard < 10:
+            guard += 1
+            params = {"category": category, "startTime": start_time_ms, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            res = self._get("/v5/position/closed-pnl", params)
+            for row in res.get("list", []):
+                try:
+                    total += float(row.get("closedPnl") or 0)
+                except (TypeError, ValueError):
+                    pass
+            cursor = res.get("nextPageCursor") or ""
+            if not cursor:
+                break
+        return total
+
     def get_positions(self, symbol: str = None) -> list:
         """All linear USDT positions, following Bybit V5 pagination cursors.
 

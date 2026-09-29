@@ -702,8 +702,9 @@ async def status():
     out["proxy"] = "set" if os.environ.get("BYBIT_PROXY") else "missing"
     if not DRY_RUN and client.configured:
         try:
+            summary = client.get_account_summary()
             out["bybit"] = {
-                "balance": client.get_balance(),
+                "balance": summary["wallet_balance"],
                 "positions": [
                     {"symbol": p.get("symbol"), "side": p.get("side"),
                      "size": p.get("size"), "avgPrice": p.get("avgPrice"),
@@ -715,13 +716,35 @@ async def status():
                     if p.get("size") not in ("0", 0, 0.0, None, "")
                 ],
             }
-            wallet = out["bybit"]["balance"]
-            avail = client.get_available_balance()
+            # Trading risk cap (margin_budget, rule v3: 70% wallet cap) is
+            # UNCHANGED - it still runs on raw wallet_balance (excludes
+            # floating PnL) so live order-sizing behaviour does not shift
+            # with this fix. These extra fields only make REPORTING match
+            # what the owner sees in the Bybit app (fixed 2026-09-29:
+            # "balance"/"wallet" here used to be walletBalance only, which
+            # is NOT the same number as Bybit's own "Margin Balance").
+            wallet = summary["wallet_balance"]
+            avail = summary["available_balance"]
             used = max(0.0, wallet - avail)
-            out["margin"] = {"wallet": wallet, "available": avail,
-                             "used": used, "cap_ratio": MARGIN_CAP,
-                             "budget": MARGIN_CAP * wallet - used,
-                             "cap_pct_used": (used / wallet * 100) if wallet else None}
+            cumulative_pnl_today = None
+            try:
+                start_of_day = int(
+                    datetime.now(timezone.utc)
+                    .replace(hour=0, minute=0, second=0, microsecond=0)
+                    .timestamp() * 1000)
+                closed_today = client.get_closed_pnl(start_of_day)
+                cumulative_pnl_today = round(closed_today + summary["unrealised_pnl"], 4)
+            except BybitError:
+                pass  # closed-pnl forensics is best-effort, never blocks /status
+            out["margin"] = {
+                "wallet": wallet, "available": avail, "used": used,
+                "cap_ratio": MARGIN_CAP, "budget": MARGIN_CAP * wallet - used,
+                "cap_pct_used": (used / wallet * 100) if wallet else None,
+                # New, accurate fields matching the Bybit app 1:1:
+                "margin_balance": summary["margin_balance"],
+                "unrealised_pnl": summary["unrealised_pnl"],
+                "cumulative_pnl_today": cumulative_pnl_today,
+            }
         except BybitError as e:
             out["bybit_error"] = str(e)
     return out
