@@ -70,7 +70,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.2.0"   # bump on every deployed change; exposed in /status
+LISTENER_VERSION = "v3.2.1"   # bump on every deployed change; exposed in /status
 PNL_CLOSE_MIN_RATIO = 0.005      # no-loss: realize only if >= 0.5% of value
 PROFIT_SKIP_RATIO = 1.03         # rule 3: skip new trades already +3%
 SIZE_NOISE_BAND = (0.85, 1.15)   # sim/price wobble that is pure PnL
