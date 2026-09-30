@@ -533,6 +533,18 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     "last_alert_qty": qty if prev is None
                     else max(qty, prev.get("last_alert_qty", 0))}
 
+        # Clean up stale orphans/mismatches (Bybit positions no longer live).
+        current_orphans = {bk for bk, _ in orphans}
+        current_mismatches = {bk for bk, _, _ in mismatches}
+        for bk in list(state.get("orphans", {}).keys()):
+            if bk not in current_orphans:
+                log_action(f"ORPHAN CLEARED {bk}: Bybit position no longer live - removing stale entry")
+                del state["orphans"][bk]
+        for bk in list(state.get("mismatches", {}).keys()):
+            if bk not in current_mismatches:
+                log_action(f"MISMATCH CLEARED {bk}: resolved or position closed - removing stale entry")
+                del state["mismatches"][bk]
+
     executed = 0
     for d in deltas:
         p = d["position"]
