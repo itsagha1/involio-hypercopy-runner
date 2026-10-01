@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).with_name(".env"), override=False)
-except ImportError:
+except (ImportError, PermissionError):
+    # systemd already loaded the root-only EnvironmentFile; do not weaken its permissions.
     pass
 
 from fastapi import FastAPI, Header, HTTPException

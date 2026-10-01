@@ -122,4 +122,14 @@ a._get=lambda path,params:{'list':[{'orderLinkId':'partial','orderStatus':'Parti
 x=a.place_order('SOLUSDT','Buy',1,order_link_id='partial')
 ok(x['partial_fill'] and x['filled_qty']==.5,'actual partial executed quantity is returned explicitly')
 
+# A root-owned .env is intentionally unreadable by the service user; systemd supplies its environment.
+import dotenv,importlib.util
+saved_loader=dotenv.load_dotenv
+def root_only(*args,**kwargs):raise PermissionError('root-only environment file')
+dotenv.load_dotenv=root_only
+try:
+ spec=importlib.util.spec_from_file_location('listener_permission_test',listener.__file__)
+ module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+ ok(module.LISTENER_VERSION==listener.LISTENER_VERSION,'service starts with protected root-only env supplied by systemd')
+finally:dotenv.load_dotenv=saved_loader
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED')
