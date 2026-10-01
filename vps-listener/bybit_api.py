@@ -283,9 +283,8 @@ class BybitClient:
 
 
 def position_idx(symbol: str, side: str) -> int:
-    if symbol.startswith("HYPE"):
-        return 1 if side == "long" else 2
-    return 0
+    # Account is in hedge mode: Buy/long = 1, Sell/short = 2 for ALL linear pairs.
+    return 1 if side == "long" else 2
 
 
 def bybit_side(side: str) -> str:
@@ -302,6 +301,8 @@ def coin_to_symbol(coin: str) -> str:
         return "1000PEPEUSDT"
     if c in ("KBONK", "1000BONK"):
         return "1000BONKUSDT"
+    if c == "PUMP":
+        return "PUMPFUNUSDT"
     if c.endswith("USDT"):
         return c
     return c + "USDT"
@@ -313,6 +314,8 @@ def symbol_to_coin(symbol: str) -> str:
         return "kPEPE"
     if s in ("1000BONKUSDT", "1000BONK"):
         return "kBONK"
+    if s in ("PUMPFUNUSDT", "PUMPFUN"):
+        return "PUMP"
     if s.endswith("USDT"):
         return symbol[:-4]
     return symbol
@@ -320,7 +323,8 @@ def symbol_to_coin(symbol: str) -> str:
 
 def round_qty(qty: float, instrument: dict) -> float:
     step = float(instrument.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
-    min_qty = float(instrument.get("lotSizeFilter", {}).get("minQty", "0.001"))
+    min_qty = float(instrument.get("lotSizeFilter", {}).get("minOrderQty",
+                instrument.get("lotSizeFilter", {}).get("minQty", "0.001")))
     rounded = float(((Decimal(str(qty))/Decimal(str(step)))+Decimal("0.000000001")).to_integral_value(rounding=ROUND_FLOOR)*Decimal(str(step)))
     if rounded < min_qty:
         raise BybitError(
