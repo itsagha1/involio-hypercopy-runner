@@ -8,14 +8,13 @@ Bybit v5 API client for the HyperCopy runner (sub-account keys only).
     HMAC (legacy): BYBIT_API_SECRET -> hex HMAC_SHA256(secret,
         timestamp + api_key + recvWindow + (queryString | rawBody))
     RSA (new Bybit flow): BYBIT_RSA_PRIVATE_KEY_FILE -> base64(RSA-SHA256
-        PKCS1v15 signature of the same payload). Generate the keypair ON the
-        VPS (openssl genrsa 4096) so the private key never leaves it.
-
-Manage-only rule details encoded here:
-  - HYPE uses hedge-mode positionIdx: 1 long / 2 short; everything else 0.
+        PKCS1v15 signature of the same payload).
 """
 
+from __future__ import annotations
+
 import hashlib
+from decimal import Decimal, ROUND_FLOOR
 import hmac
 import json
 import os
@@ -32,18 +31,22 @@ class BybitError(Exception):
 
 
 class BybitClient:
-    def __init__(self, api_key=None, api_secret=None, rsa_key_file=None,
-                 proxy=None, testnet=False):
+    def __init__(self, api_key: str | None = None, api_secret: str | None = None,
+                 rsa_key_file: str | None = None, proxy: str | None = None,
+                 testnet: bool = False):
         self.key = api_key or os.environ.get("BYBIT_API_KEY", "")
         self.secret = api_secret or os.environ.get("BYBIT_API_SECRET", "")
         self.rsa_key = None
         rsa_key_file = rsa_key_file or os.environ.get("BYBIT_RSA_PRIVATE_KEY_FILE", "")
         if not self.secret and rsa_key_file:
-            with open(os.path.abspath(rsa_key_file), "rb") as f:
-                pem = f.read()
-            if b"PRIVATE KEY" in pem:
-                from cryptography.hazmat.primitives import serialization
-                self.rsa_key = serialization.load_pem_private_key(pem, password=None)
+            try:
+                with open(os.path.abspath(rsa_key_file), "rb") as f:
+                    pem = f.read()
+                if b"PRIVATE KEY" in pem:
+                    from cryptography.hazmat.primitives import serialization
+                    self.rsa_key = serialization.load_pem_private_key(pem, password=None)
+            except OSError:
+                pass
         proxy = proxy or os.environ.get("BYBIT_PROXY", "")
         self.base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.session = requests.Session()
@@ -59,7 +62,6 @@ class BybitClient:
         msg = f"{ts}{self.key}{RECV_WINDOW}{param_str}".encode()
         if self.secret:  # legacy HMAC
             return hmac.new(self.secret.encode(), msg, hashlib.sha256).hexdigest()
-        # RSA-SHA256 PKCS1v15, base64-encoded (Bybit self-generated key flow)
         import base64
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
@@ -83,8 +85,12 @@ class BybitClient:
             "X-BAPI-RECV-WINDOW": RECV_WINDOW,
             "X-BAPI-SIGN": self._sign(ts, qs),
         }
-        r = self.session.get(self.base + path + "?" + qs, headers=headers, timeout=20)
-        return self._check(r.json(), path)
+        try:
+            r=self.session.get(self.base+path+"?"+qs,headers=headers,timeout=20)
+            r.raise_for_status()
+            return self._check(r.json(),path)
+        except (requests.RequestException,ValueError) as e:
+            raise BybitError("Bybit read transport failure: "+type(e).__name__) from None
 
     def _post(self, path: str, body: dict) -> dict:
         if not self.configured:
@@ -97,10 +103,14 @@ class BybitClient:
             "X-BAPI-RECV-WINDOW": RECV_WINDOW,
             "X-BAPI-SIGN": self._sign(ts, raw),
         }
-        r = self.session.post(self.base + path, data=raw.encode(), headers=headers, timeout=20)
-        return self._check(r.json(), path)
+        try:
+            r=self.session.post(self.base+path,data=raw.encode(),headers=headers,timeout=20)
+            r.raise_for_status()
+            return self._check(r.json(),path)
+        except (requests.RequestException,ValueError) as e:
+            raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None
 
-    # ---------- market data (public, still proxied) ----------
+    # ---------- market data ----------
 
     def get_ticker(self, symbol: str) -> dict:
         res = self._get("/v5/market/tickers", {"category": "linear", "symbol": symbol})
@@ -137,15 +147,6 @@ class BybitClient:
             raise BybitError(f"could not parse available balance: {e}") from e
 
     def get_account_summary(self, coin: str = "USDT") -> dict:
-        """One call, all account-level figures Bybit's own UI uses.
-
-        walletBalance excludes floating (unrealised) PnL; Bybit's UI
-        "Margin Balance" = totalMarginBalance, which DOES include it
-        (roughly totalWalletBalance + totalPerpUPL). Reporting code must
-        use totalMarginBalance/totalPerpUPL to match what the owner sees
-        in the app - a bug fixed 2026-09-29 (previously only walletBalance
-        was read, understating how much floating losses had eaten into
-        the account)."""
         res = self._get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
         try:
             acct = res["list"][0]
@@ -170,12 +171,6 @@ class BybitClient:
         }
 
     def get_closed_pnl(self, start_time_ms: int, category: str = "linear") -> float:
-        """Sum of realised PnL for positions closed since start_time_ms.
-
-        Bybit's own "Cumulative P&L" on the Positions tab is realised
-        PnL from today's closed trades PLUS current unrealised PnL - not
-        just the live positions' floating PnL. Paginates via cursor,
-        capped at 10 pages (2000 rows) as a sane forensics limit."""
         total, cursor, guard = 0.0, "", 0
         while guard < 10:
             guard += 1
@@ -193,14 +188,7 @@ class BybitClient:
                 break
         return total
 
-    def get_positions(self, symbol: str = None) -> list:
-        """All linear USDT positions, following Bybit V5 pagination cursors.
-
-        CRITICAL: /v5/position/list returns at most `limit` rows per page
-        (default 20) plus nextPageCursor. Without pagination any position
-        beyond the first page looks "closed" to the caller, which previously
-        made the listener deregister live mirrors (orphan bug, 2026-09-26).
-        """
+    def get_positions(self, symbol: str | None = None) -> list:
         params = {"category": "linear", "settleCoin": "USDT", "limit": 200}
         if symbol:
             params["symbol"] = symbol
@@ -214,30 +202,46 @@ class BybitClient:
             if not cursor:
                 break
             guard += 1
-            if guard > 20:  # safety cap (~4000 positions)
+            if guard > 20:
                 raise BybitError("position pagination did not terminate")
         return out
 
     def get_order_history(self, symbol: str, limit: int = 50) -> list:
-        """Closed+open order history for a linear symbol (forensics)."""
         params = {"category": "linear", "symbol": symbol, "limit": limit}
         return self._get("/v5/order/history", params).get("list", [])
 
     # ---------- trading ----------
 
-    def place_order(self, symbol: str, side: str, qty: float, position_idx: int = 0,
-                    reduce_only: bool = False) -> dict:
-        body = {
-            "category": "linear",
-            "symbol": symbol,
-            "side": side,  # "Buy" opens long / closes short; "Sell" the reverse
-            "orderType": "Market",
-            "qty": f"{qty}",
-            "positionIdx": position_idx,
-        }
-        if reduce_only:
-            body["reduceOnly"] = True
-        return self._post("/v5/order/create", body)
+    def get_linked_order(self,symbol,link):
+        params={"category":"linear","symbol":symbol,"orderLinkId":link,"limit":1}
+        for path in ("/v5/order/realtime","/v5/order/history"):
+            rows=self._get(path,params).get("list",[])
+            matches=[r for r in rows if r.get("orderLinkId")==link]
+            if matches:return matches[0]
+        return None
+
+    def place_order(self,symbol,side,qty,position_idx=0,reduce_only=False,order_link_id=None):
+        body={"category":"linear","symbol":symbol,"side":side,"orderType":"Market","qty":str(qty),"positionIdx":position_idx}
+        if reduce_only:body["reduceOnly"]=True
+        if order_link_id:body["orderLinkId"]=order_link_id
+        try:result=self._post("/v5/order/create",body)
+        except BybitError as e:
+            if not order_link_id:raise
+            existing=self.get_linked_order(symbol,order_link_id)
+            if not existing:raise e
+            result={"orderId":existing.get("orderId"),"recovered":True}
+        if order_link_id:
+            for attempt in range(3):
+                order=self.get_linked_order(symbol,order_link_id)
+                if order and order.get("orderStatus")=="Filled" and abs(float(order.get("cumExecQty") or 0)-qty)<=max(1e-9,qty*1e-8):
+                    return {**result,"fill_confirmed":True,"filled_qty":float(order["cumExecQty"]),"filled_avg_price":float(order.get("avgPrice") or 0)}
+                if order and order.get("orderStatus") in ("Cancelled","PartiallyFilledCanceled") and float(order.get("cumExecQty") or 0)>0:
+                    return {**result,"fill_confirmed":True,"partial_fill":True,"filled_qty":float(order["cumExecQty"]),"filled_avg_price":float(order.get("avgPrice") or 0)}
+                if order and order.get("orderStatus") in ("Rejected","Cancelled","PartiallyFilledCanceled"):
+                    raise BybitError("Linked order not fully filled; reconciliation required: "+order_link_id)
+                time.sleep(0.3)
+            raise BybitError("Linked order fill not confirmed; reconciliation required: "+order_link_id)
+        return result
 
     def set_leverage(self, symbol: str, leverage: int) -> dict:
         body = {
@@ -253,65 +257,78 @@ class BybitClient:
                 return {}
             raise
 
-    def set_sl_tp(self, symbol: str, stop_loss, take_profit,
+    def set_sl_tp(self, symbol: str, stop_loss: float | str | None, take_profit: float | str | None,
                   position_idx: int = 0) -> dict:
-        """Sync source SL/TP (absolute prices) onto the Bybit position."""
+        """Sync source SL/TP onto the Bybit position. Bybit v5 uses '0' to clear fields."""
         body = {
             "category": "linear",
             "symbol": symbol,
             "positionIdx": position_idx,
+            "stopLoss": format(Decimal(str(stop_loss)),"f") if stop_loss else "0",
+            "takeProfit": format(Decimal(str(take_profit)),"f") if take_profit else "0",
         }
-        if stop_loss:
-            body["stopLoss"] = f"{stop_loss}"
-        if take_profit:
-            body["takeProfit"] = f"{take_profit}"
-        if "stopLoss" not in body and "takeProfit" not in body:
-            return {}
         return self._post("/v5/position/set-trading-stop", body)
 
-    def set_trailing_stop(self, symbol: str, active_price: float, distance_pct: float,
+    def set_trailing_stop(self, symbol: str, active_price: float, trailing_distance: float,
                           position_idx: int = 0) -> dict:
+        """Set absolute price trailing stop on Bybit v5 (distance in absolute USDT)."""
         body = {
             "category": "linear",
             "symbol": symbol,
             "positionIdx": position_idx,
-            "trailingStop": f"{distance_pct}",
+            "trailingStop": f"{trailing_distance}",
             "activePrice": f"{active_price}",
         }
         return self._post("/v5/position/set-trading-stop", body)
 
 
 def position_idx(symbol: str, side: str) -> int:
-    """HYPE runs in hedge mode: 1 = long, 2 = short. Everything else one-way: 0."""
     if symbol.startswith("HYPE"):
         return 1 if side == "long" else 2
     return 0
 
 
 def bybit_side(side: str) -> str:
-    """Involio 'long'/'short' -> Bybit open-side 'Buy'/'Sell'."""
     return "Buy" if side == "long" else "Sell"
 
 
 def close_side(side: str) -> str:
-    """Side that closes a position opened with `side`."""
     return "Sell" if side == "long" else "Buy"
 
 
 def coin_to_symbol(coin: str) -> str:
-    return coin.upper() + "USDT"
+    c = coin.upper()
+    if c in ("KPEPE", "1000PEPE"):
+        return "1000PEPEUSDT"
+    if c in ("KBONK", "1000BONK"):
+        return "1000BONKUSDT"
+    if c.endswith("USDT"):
+        return c
+    return c + "USDT"
 
 
 def symbol_to_coin(symbol: str) -> str:
-    return symbol[:-4] if symbol.endswith("USDT") else symbol
+    s = symbol.upper()
+    if s in ("1000PEPEUSDT", "1000PEPE"):
+        return "kPEPE"
+    if s in ("1000BONKUSDT", "1000BONK"):
+        return "kBONK"
+    if s.endswith("USDT"):
+        return symbol[:-4]
+    return symbol
 
 
 def round_qty(qty: float, instrument: dict) -> float:
-    """Round qty down onto the symbol's lot grid; raise if below minQty."""
     step = float(instrument.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
     min_qty = float(instrument.get("lotSizeFilter", {}).get("minQty", "0.001"))
-    rounded = max(0.0, (int(qty / step)) * step)
+    rounded = float(((Decimal(str(qty))/Decimal(str(step)))+Decimal("0.000000001")).to_integral_value(rounding=ROUND_FLOOR)*Decimal(str(step)))
     if rounded < min_qty:
         raise BybitError(
-            f"qty {qty} too small: minQty={min_qty} step={step} (increase --margin or --leverage)")
+            f"qty {qty} too small: minQty={min_qty} step={step}")
     return round(rounded, 10)
+
+
+def round_step(val: float, step: float) -> float:
+    if step <= 0:
+        return val
+    return round(round(val / step) * step, 8)

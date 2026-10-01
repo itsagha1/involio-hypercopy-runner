@@ -20,6 +20,9 @@ DIRTY=$("${GIT[@]}" diff --name-only HEAD -- . ':!vps-listener/vps_state.json')
 mkdir -p /var/lib/hypercopy-backups
 chmod 700 /var/lib/hypercopy-backups
 BACKUP=$(mktemp -d /var/lib/hypercopy-backups/update.XXXXXX)
+RESTARTED=0
+trap 'if [ "$RESTARTED" = 0 ]; then systemctl restart hypercopy-listener.service; fi' EXIT
+systemctl stop hypercopy-listener.service
 STATE="$REPO/vps-listener/vps_state.json"
 [ ! -f "$STATE" ] || cp -p "$STATE" "$BACKUP/state.json"
 restore_state() { [ ! -f "$BACKUP/state.json" ] || cp -p "$BACKUP/state.json" "$STATE"; }
@@ -28,27 +31,21 @@ rollback() {
   "${GIT[@]}" reset --hard "$OLD"
   restore_state
   systemctl restart hypercopy-listener.service
+  RESTARTED=1
   exit 1
 }
 echo "Updating $OLD -> $NEW"
 "${GIT[@]}" merge --ff-only origin/main || { restore_state; exit 1; }
 restore_state
 cd vps-listener
-"$PY" tests/test_rules.py || rollback
-if [ -f tests/test_cutover.py ]; then
-  if ! "$PY" - <<'PY'
-import runpy
-suite=runpy.run_path('tests/test_cutover.py')
-functions=[(name,fn) for name,fn in suite.items() if name.startswith('test_') and callable(fn)]
-assert functions, 'No cutover tests discovered'
-for name,fn in functions:
-    fn()
-print('Cutover test functions passed:', len(functions))
-PY
-  then rollback; fi
+if [ -f "$REPO/tests/run_offline.py" ]; then
+  env BYBIT_API_KEY= BYBIT_API_SECRET= BYBIT_RSA_PRIVATE_KEY_FILE= BYBIT_PROXY= DRY_RUN=true "$PY" "$REPO/tests/run_offline.py" || rollback
+else
+  env BYBIT_API_KEY= BYBIT_API_SECRET= BYBIT_RSA_PRIVATE_KEY_FILE= BYBIT_PROXY= DRY_RUN=true "$PY" tests/test_rules.py || rollback
 fi
 EXPECTED=$("$PY" -c 'import re; print(re.search(r"LISTENER_VERSION\s*=\s*\"([^\"]+)\"",open("listener.py").read()).group(1))')
 systemctl restart hypercopy-listener.service || rollback
+RESTARTED=1
 for attempt in $(seq 1 20); do
   if "$PY" - "$EXPECTED" <<'PY'
 import sys,json,urllib.request
