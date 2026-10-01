@@ -53,4 +53,39 @@ else:raise AssertionError('wrong portfolio accepted')
 try:source_api.normalize_source(meta,[raw],sims,'limpan96')
 except source_api.SourceDataError:ok(True,'adapter cannot fetch an unrequested profile')
 else:raise AssertionError('unrequested profile accepted')
+from bybit_api import coin_to_symbol, symbol_to_coin
+ok(coin_to_symbol('PUMP')=='PUMPFUNUSDT','PUMP source ticker maps to the live Bybit PUMPFUN contract')
+ok(symbol_to_coin('PUMPFUNUSDT')=='PUMP','PUMPFUN contract maps back to source ticker PUMP')
+# Synthetic retry test: after mapping or transient failures, an already-seen open source entry is still eligible.
+st={'books':{'akira':books([a])},'baseline':['akira|ac20167c-ad9c-4f2a-8add-4fd206dbf'],'mirrored':{},'manual':[],
+ 'manual_adopted':True,'fresh_start_at':books([])['snapshot_at'],'hold_new':False,'cutover_armed':True,'entry_blocks':{}}
+listener.save_state(st); f=FakeClient(); f.ticker_prices['PUMPFUNUSDT']=0.00565; listener.BybitClient=lambda:f
+fresh=pos(ticker='PUMP',side='short',sid='pump-fresh',sq=1000,lev=7,ep=0.00565,cp=0.00565)
+asyncio.run(listener.involio_delta(listener.WebhookPayload(source='test',books={'akira':books([a,fresh])},hold_new=False),x_signature='testsecret'))
+ok(any(o.get('symbol')=='PUMPFUNUSDT' for o in f.orders),'current unmirrored Akira PUMP is retried against live PUMPFUN contract')
+import source_api as sa
+orig=sa.fetch_source_book
+calls={'n':0}
+fake_book=dict(books([a]))
+def flaky(profile=sa.PROFILE):
+    calls['n']+=1
+    if calls['n']<3:raise sa.SourceDataError('Source snapshot counts disagree; not safe to infer closures')
+    return fake_book
+sa.fetch_source_book=flaky
+real_sleep=asyncio.sleep
+slept=[]
+async def fake_sleep(t):slept.append(t)
+asyncio.sleep=fake_sleep
+resp=asyncio.run(listener.source_snapshot(profile='akira',x_signature='testsecret'))
+asyncio.sleep=real_sleep;sa.fetch_source_book=orig
+ok(resp.get('ok') is True and calls['n']==3,'transient source inconsistency retried until a consistent snapshot')
+ok([t for t in slept if t>0]==[2,4],'retry pauses briefly between attempts')
+calls['n']=0
+def hopeless(profile=sa.PROFILE):
+    calls['n']+=1;raise sa.SourceDataError('credential missing')
+sa.fetch_source_book=hopeless;asyncio.sleep=fake_sleep
+try:asyncio.run(listener.source_snapshot(profile='akira',x_signature='testsecret'))
+except Exception as ex:ok('503' in str(ex),'persistent source failure still fails closed with no book forwarded')
+else:raise AssertionError('persistent failure was served')
+finally:asyncio.sleep=real_sleep;sa.fetch_source_book=orig
 print('ALL '+str(PASS)+' PROFILE CHECKS PASSED')

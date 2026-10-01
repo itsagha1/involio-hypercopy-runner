@@ -40,7 +40,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.5.0"
+LISTENER_VERSION = "v3.5.2"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -133,6 +133,7 @@ def load_state() -> Dict[str, Any]:
             s.setdefault("prepared_at", None)
             s.setdefault("prepared_profile", None)
             s.setdefault("parked_ambiguous", {})
+            s.setdefault("entry_blocks", {})
             return s
         except (json.JSONDecodeError, OSError):
             pass
@@ -142,7 +143,7 @@ def load_state() -> Dict[str, Any]:
             "errors_last_run": 0, "manual": [], "manual_adopted": False,
             "orphans": {}, "mismatches": {}, "dereg_pending": [],
             "cutover_armed": False, "hold_new": True, "prepared_at": None,
-            "prepared_profile": None, "parked_ambiguous": {}}
+            "prepared_profile": None, "parked_ambiguous": {}, "entry_blocks": {}}
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -507,9 +508,12 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
             return f"SKIP {key}: source target already crossed; exchange cannot place the mirrored target",None
 
         their_qty = desired_notional / price
+        lot_filter = inst.get("lotSizeFilter", {})
+        min_qty = float(lot_filter.get("minOrderQty") or lot_filter.get("minQty") or "0")
+        if min_qty and their_qty < min_qty:
+            return f"SKIP {key} new_entry: exact mirror qty {their_qty:.10f} below exchange minimum qty {min_qty}; no oversizing", None
         qty = round_qty(their_qty, inst)
 
-        lot_filter = inst.get("lotSizeFilter", {})
         max_qty = float(lot_filter.get("maxMktOrderQty") or lot_filter.get("maxOrderQty") or lot_filter.get("maxQty", "99999999"))
         if qty > max_qty:
             return f"SKIP {key} new_entry: calculated qty {qty} exceeds exchange maxQty {max_qty}", None
@@ -936,6 +940,20 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
             if k not in state.get("mirrored",{}) or k in state.get("retained_trailing",{}):close_pending.pop(k,None)
             elif k not in live_source and k not in close_keys:deltas.append(d)
         save_state(state)
+        # Retry/fix path: if a verified current source position is not baseline and has no mirror,
+        # process it as a new entry on every fresh profile snapshot. This prevents a transient
+        # exchange/API/mapping failure from consuming the source entry forever, while duplicate
+        # orders remain blocked by mirrored/parked checks and idempotent order_link ids.
+        existing_delta_keys={tkey(d["trader"],d["position"]) for d in deltas}
+        for trader,book in payload.books.items():
+            trader_norm=normalize_trader(trader)
+            if trader_norm not in AUTHORIZED_PROFILES:continue
+            for p in book.get("positions",[]):
+                k=tkey(trader_norm,p);bid=baseline_id(trader_norm,p)
+                if bid in state.get("baseline",[]) or (trader_norm==SOLE_SOURCE_PROFILE and p["source_id"] in state.get("baseline",[])) or k in state.get("mirrored",{}) or k in existing_delta_keys:
+                    continue
+                deltas.append({"trader":trader_norm,"type":"new_entry","position":p,"retry_current":True})
+                existing_delta_keys.add(k)
 
 
         client = BybitClient()
@@ -1037,9 +1055,16 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     action, new_rec = open_mirror(client, d["trader"], p, book_info, state)
                     if new_rec:
                         executed += 1
+                        state.setdefault("entry_blocks", {}).pop(k, None)
+                        log_action(action)
                     elif action.startswith("ERROR"):
                         errors += 1
-                    log_action(action)
+                        log_action(action)
+                    else:
+                        blocks=state.setdefault("entry_blocks", {})
+                        if blocks.get(k) != action:
+                            blocks[k]=action
+                            log_action(action)
 
             elif t in ("size_add", "size_reduce"):
                 if rec and rec.get("leverage_blocked"):continue
@@ -1229,9 +1254,18 @@ async def source_snapshot(profile:str=SOLE_SOURCE_PROFILE,x_signature:str=Header
     secret=get_shared_secret()
     if not secret or not hmac.compare_digest(x_signature,secret):raise HTTPException(403,"bad signature")
     if profile not in AUTHORIZED_PROFILES:raise HTTPException(400,"Unauthorized source profile")
-    from source_api import fetch_source_book
+    from source_api import fetch_source_book, SourceDataError
+    book=None
     try:
-        book=await run_in_threadpool(fetch_source_book,profile)
+        for attempt in range(3):
+            try:
+                book=await run_in_threadpool(fetch_source_book,profile)
+                break
+            except SourceDataError:
+                # Transient source-side inconsistency (counts/pages changing mid-fetch).
+                # Fresh full refetch after a short pause; only give up after the third attempt.
+                if attempt==2:raise
+                await asyncio.sleep(2+attempt*2)
         return {"ok":True,"book":book}
     except Exception as e:
         state=load_state()
