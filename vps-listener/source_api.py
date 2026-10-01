@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import math, os, requests
 PROFILE = 'booobsas'
 PORTFOLIO_ID = '1c4f8dfd-3e4c-4378-b6fd-a0f694c10fd3'
+PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837'}
 BASE = 'https://api.involio.com'
 
 class SourceDataError(RuntimeError):
@@ -15,11 +16,13 @@ def positive(value, name):
         raise SourceDataError('Nonpositive '+name)
     return value
 
-def normalize_source(meta, raw_positions, sims):
+def normalize_source(meta, raw_positions, sims, profile=PROFILE):
+    if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+    portfolio_id=PROFILES[profile]
     portfolio = meta.get('portfolio') or {}
-    if meta.get('success') is not True or portfolio.get('id') != PORTFOLIO_ID:
+    if meta.get('success') is not True or portfolio.get('id') != portfolio_id:
         raise SourceDataError('Wrong or incomplete source portfolio')
-    if (portfolio.get('owner') or {}).get('username') != PROFILE:
+    if (portfolio.get('owner') or {}).get('username') != profile:
         raise SourceDataError('Wrong source owner')
     if sims.get('success') is not True or not isinstance(sims.get('investments'), list):
         raise SourceDataError('Incomplete source sim data')
@@ -49,7 +52,7 @@ def normalize_source(meta, raw_positions, sims):
         if pct>100: raise SourceDataError('Invalid declared allocation percentage')
         if not isinstance(position.get('directionLong'), bool):
             raise SourceDataError('Missing source direction')
-        if (position.get('portfolio') or {}).get('id') != PORTFOLIO_ID:
+        if (position.get('portfolio') or {}).get('id') != portfolio_id:
             raise SourceDataError('Position belongs to a different source portfolio')
         ticker=str(position.get('ticker') or '')
         if not ticker: raise SourceDataError('Missing source ticker')
@@ -72,12 +75,14 @@ def normalize_source(meta, raw_positions, sims):
     return {'positions':positions,'source_equity':capital,'equity_verified':True,
             'source_equity_basis':'gross_sim_allocatable_capital_not_fee_net_mark_equity',
             'allocation_basis':'declared_entrySize_percent',
-            'source_portfolio_id':PORTFOLIO_ID,'source_profile':PROFILE,
+            'source_portfolio_id':portfolio_id,'source_profile':profile,
             'remaining_sim':remaining,'complete':True,
             'snapshot_at':datetime.now(timezone.utc).isoformat(),
             'source_total_fees':sims.get('portfolioTotalFeeSim')}
 
-def fetch_source_book():
+def fetch_source_book(profile=PROFILE):
+    if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+    portfolio_id=PROFILES[profile]
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
     session=requests.Session()
@@ -93,14 +98,14 @@ def fetch_source_book():
         if value.get('success') is not True or value.get('error'):
             raise SourceDataError('Source API failed for '+path)
         return value
-    metadata=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':PORTFOLIO_ID})
+    metadata=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
     positions=[]
     for page in range(1,22):
         if page>20: raise SourceDataError('Source pagination exceeded safety bound')
-        value=post('/v1_0/investments/get_investments',{'portfolioId':PORTFOLIO_ID,'isOpen':True,'params':{'page':page,'size':50}})
+        value=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':page,'size':50}})
         batch=value.get('investmentsTicker')
         if not isinstance(batch,list): raise SourceDataError('Missing open-position page')
         positions.extend(batch)
         if len(batch)<50: break
-    sims=post('/v1_0/investments/get_investments_sims',{'portfolioId':PORTFOLIO_ID})
-    return normalize_source(metadata,positions,sims)
+    sims=post('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
+    return normalize_source(metadata,positions,sims,profile)

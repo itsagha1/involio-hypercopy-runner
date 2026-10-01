@@ -40,8 +40,9 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.4.0"
-SOLE_SOURCE_PROFILE = "booobsas"
+LISTENER_VERSION = "v3.5.0"
+SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
+AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
 PROFIT_SKIP_ROI = 0.03            # rule: skip new trades already >= +3% source ROI on margin
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
@@ -57,7 +58,7 @@ LOG_TAIL_LINES = 60
 STATE_LOCK = threading.RLock()
 RISK_TASK = None
 
-app = FastAPI(title="Involio Bybit Cutover Listener v3.3 (booobsas sole source)")
+app = FastAPI(title="Bybit mirror v3.5: booobsas and akira Crypto")
 
 
 class WebhookPayload(BaseModel):
@@ -161,6 +162,9 @@ def tkey(trader: str, p: Dict[str, Any]) -> str:
     return f"{trader_norm}|{ticker}/{side}"
 
 
+def baseline_id(trader,p):
+    return normalize_trader(trader)+"|"+str(p.get("source_id") or tkey(trader,p))
+
 def mirror_bybit_key(k: str) -> str:
     """'trader|COIN/side|source_id' -> 'COIN/side'."""
     parts = k.split("|")
@@ -179,6 +183,17 @@ def parse_ts(ts: Optional[str]) -> Optional[datetime]:
 
 
 def validate_booobsas_book(books: Dict[str, Any], snapshot_at_str: Optional[str] = None) -> Tuple[bool, str]:
+    # Compatibility name. Every supplied book must belong to an authorized profile.
+    if not isinstance(books,dict) or not books:return False,"REJECT: no source books"
+    normalized=[normalize_trader(k) for k in books]
+    if len(set(normalized))!=len(normalized) or any(k not in AUTHORIZED_PROFILES for k in normalized):
+        return False,"REJECT: unauthorized or duplicate source profile"
+    for key,book in books.items():
+        valid,reason=validate_single_book({key:book},snapshot_at_str,normalize_trader(key))
+        if not valid:return False,reason
+    return True,""
+
+def validate_single_book(books: Dict[str, Any], snapshot_at_str: Optional[str] = None, profile: str = SOLE_SOURCE_PROFILE) -> Tuple[bool, str]:
     """Strict contract validation for books['booobsas'].
     Fails closed if missing, unverified, incomplete, stale (>10min), or future (>30s).
     """
@@ -187,22 +202,22 @@ def validate_booobsas_book(books: Dict[str, Any], snapshot_at_str: Optional[str]
     
     target_key = None
     for k in books.keys():
-        if normalize_trader(k) == SOLE_SOURCE_PROFILE:
+        if normalize_trader(k) == profile:
             target_key = k
             break
             
     if len(books) != 1:
         return False, "REJECT: only one authorized source book is allowed"
     if not target_key:
-        return False, f"REJECT: missing '{SOLE_SOURCE_PROFILE}' in books payload"
+        return False, f"REJECT: missing '{profile}' in books payload"
         
     book = books[target_key]
     if not isinstance(book, dict):
-        return False, f"REJECT: '{SOLE_SOURCE_PROFILE}' book is not a dict"
+        return False, f"REJECT: '{profile}' book is not a dict"
     if book.get("complete") is not True:
-        return False, f"REJECT: '{SOLE_SOURCE_PROFILE}' book complete flag is not True"
+        return False, f"REJECT: '{profile}' book complete flag is not True"
     if book.get("equity_verified") is not True:
-        return False, f"REJECT: '{SOLE_SOURCE_PROFILE}' book equity_verified flag is not True"
+        return False, f"REJECT: '{profile}' book equity_verified flag is not True"
     source_equity = float(book.get("source_equity") or 0)
     if not math.isfinite(source_equity) or source_equity <= 0:
         return False, f"REJECT: source_equity ({source_equity}) <= 0"
@@ -320,7 +335,7 @@ def migrate_legacy_mirrors(state: Dict[str, Any]) -> List[str]:
     migrated = []
     for k in list(mirrored.keys()):
         trader = normalize_trader(k.split("|")[0])
-        if trader != SOLE_SOURCE_PROFILE:
+        if trader not in AUTHORIZED_PROFILES:
             bk = mirror_bybit_key(k)
             manual.add(bk)
             del mirrored[k]
@@ -336,7 +351,7 @@ def compute_deltas(prev_books: Dict[str, Any], books: Dict[str, Any]) -> List[Di
     deltas = []
     for raw_trader, book in books.items():
         trader = normalize_trader(raw_trader)
-        if trader != SOLE_SOURCE_PROFILE:
+        if trader not in AUTHORIZED_PROFILES:
             continue
         prev_positions = {}
         for p in prev_books.get(raw_trader, {}).get("positions", []):
@@ -875,6 +890,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     break
             baseline = [p.get("source_id") or tkey(SOLE_SOURCE_PROFILE, p)
                         for p in payload.books.get(target_key, {}).get("positions", [])]
+            baseline=[baseline_id(trader,p) for trader,book in payload.books.items() for p in book.get("positions",[])]
             state["baseline"] = baseline
             state["fresh_start_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             state["books"] = payload.books
@@ -901,10 +917,17 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
             log_action(f"HOLD MODE {'ON' if state['hold_new'] else 'OFF'}: new mirrors "
                        f"{'blocked' if state['hold_new'] else 'resumed'}")
 
-        prev_books = state.get("books", {})
+        prev_books = dict(state.get("books", {}))
+        for trader,book in payload.books.items():
+            if normalize_trader(trader) in AUTHORIZED_PROFILES and trader not in prev_books:
+                added=[baseline_id(trader,p) for p in book.get("positions",[])]
+                state["baseline"]=sorted(set(state.get("baseline",[])+added))
+                prev_books[trader]=book
+                log_action(f"PROFILE BASELINE {trader}: {len(added)} existing positions excluded; future new trades eligible")
+        effective_books={**prev_books,**payload.books}
         deltas = compute_deltas(prev_books, payload.books)
         close_pending=state.setdefault("source_close_pending",{})
-        live_source={tkey(trader,p) for trader,b in payload.books.items() for p in b.get("positions",[])}
+        live_source={tkey(trader,p) for trader,b in effective_books.items() for p in b.get("positions",[])}
         close_keys={tkey(d["trader"],d["position"]) for d in deltas if d["type"]=="source_close"}
         for d in deltas:
             if d["type"]=="source_close" and tkey(d["trader"],d["position"]) in state.get("mirrored",{}):
@@ -975,16 +998,18 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
             sid = p.get("source_id") or k
             t = d["type"]
 
-            if trader_norm != SOLE_SOURCE_PROFILE:
+            if trader_norm not in AUTHORIZED_PROFILES:
                 log_action(f"SKIP {k} {t}: non-authorized profile (sole source is {SOLE_SOURCE_PROFILE})")
                 continue
 
-            if t == "source_close" and sid in state.get("baseline", []):
-                state["baseline"].remove(sid)
+            bid=baseline_id(trader_norm,p)
+            protected=bid if bid in state.get("baseline",[]) else (sid if trader_norm==SOLE_SOURCE_PROFILE and sid in state.get("baseline",[]) else None)
+            if t == "source_close" and protected:
+                state["baseline"].remove(protected)
                 log_action(f"BASELINE-CLOSED {sid}: removed from baseline (re-opens will be mirrored as new trades)")
                 continue
 
-            if sid in state.get("baseline", []):
+            if protected:
                 log_action(f"SKIP {sid} {t}: baseline position")
                 continue
 
@@ -1000,7 +1025,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
 
                 target_bk_key = d["trader"]
                 for bk in payload.books.keys():
-                    if normalize_trader(bk) == SOLE_SOURCE_PROFILE:
+                    if normalize_trader(bk) == trader_norm:
                         target_bk_key = bk
                         break
                 book_info = payload.books.get(target_bk_key, {})
@@ -1084,7 +1109,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                         except BybitError as e:
                             errors+=1;log_action(f"ERROR {k} leverage update: {e}")
 
-        state["books"] = payload.books
+        state["books"] = effective_books
         state["last_webhook"] = payload.fired_at
         state["last_processed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         state["deltas_last_run"] = len(deltas)
@@ -1135,6 +1160,7 @@ async def cutover_config(req: CutoverConfigRequest, x_signature: str = Header(de
                     break
             baseline = [p.get("source_id") or tkey(SOLE_SOURCE_PROFILE, p)
                         for p in books.get(target_bk_key, {}).get("positions", [])]
+            baseline=[baseline_id(trader,p) for trader,book in books.items() for p in book.get("positions",[])]
             state["baseline"] = sorted(list(set(state.get("baseline", []) + baseline)))
             state["hold_new"] = True
             state["cutover_armed"] = False
@@ -1180,8 +1206,8 @@ def health():
         except BybitError as e:error=str(e)
     wallet=account.get("wallet_balance");avail=account.get("available_balance")
     return {"ok":error is None,"status":"ok" if error is None else "error",
-            "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"booobsas_full_balance",
-            "sole_source_profile":SOLE_SOURCE_PROFILE,"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
+            "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"multi_profile_full_balance",
+            "sole_source_profile":None,"authorized_profiles":sorted(AUTHORIZED_PROFILES),"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
             "proxy":"set" if os.environ.get("BYBIT_PROXY") else "missing","bybit_configured":client.configured,
             "wallet_balance":wallet,"available_balance":avail,"bybit":{"balance":account.get("margin_balance"),"positions":positions,**({"error":error} if error else {})},
             "margin":{"wallet":wallet,"available":avail,"cap_ratio":MARGIN_CAP,"budget":max(0,(wallet or 0)-profile_allocated_margin(state)),
@@ -1199,18 +1225,19 @@ def log_endpoint(n:int=400):
     return {"ok":True,"code_version":LISTENER_VERSION,"lines":log_tail(min(max(n,1),2000))}
 
 @app.get("/source/snapshot")
-async def source_snapshot(x_signature:str=Header(default="")):
+async def source_snapshot(profile:str=SOLE_SOURCE_PROFILE,x_signature:str=Header(default="")):
     secret=get_shared_secret()
     if not secret or not hmac.compare_digest(x_signature,secret):raise HTTPException(403,"bad signature")
+    if profile not in AUTHORIZED_PROFILES:raise HTTPException(400,"Unauthorized source profile")
     from source_api import fetch_source_book
     try:
-        book=await run_in_threadpool(fetch_source_book)
+        book=await run_in_threadpool(fetch_source_book,profile)
         return {"ok":True,"book":book}
     except Exception as e:
         state=load_state()
         reason=type(e).__name__
         prefix="ERROR" if state.get("mirrored") or "credential" in str(e).lower() else "LOG"
-        log_action(f"{prefix} source snapshot unavailable: {reason}; no closures inferred")
+        log_action(f"{prefix} {profile} source snapshot unavailable: {reason}; no closures inferred")
         raise HTTPException(503,"Source snapshot unavailable; no book forwarded")
 
 def recover_parked_entries(client,state):
@@ -1222,12 +1249,12 @@ def recover_parked_entries(client,state):
         filled=float(order.get("cumExecQty") or 0)
         p=intent["position"];bk=p["ticker"]+"/"+p["side"]
         if filled<=0:
-            state.setdefault("baseline",[]).append(p["source_id"])
+            state.setdefault("baseline",[]).append(baseline_id(key.split("|")[0],p))
             state["parked_ambiguous"].pop(key,None)
             continue
         live=fetch_open_mirrors(client);position=live.get(bk)
         if position is None:
-            state.setdefault("baseline",[]).append(p["source_id"])
+            state.setdefault("baseline",[]).append(baseline_id(key.split("|")[0],p))
             state["parked_ambiguous"].pop(key,None)
             log_action(f"LOG {key}: submitted trade already closed; not reopening")
             continue
@@ -1243,9 +1270,9 @@ def recover_parked_entries(client,state):
         state.get("orphans",{}).pop(bk,None)
         current=next((x for b in state.get("books",{}).values() for x in b.get("positions",[]) if x.get("source_id")==p["source_id"]),None)
         save_state(state)
-        if current:log_action(sync_sltp(client,SOLE_SOURCE_PROFILE,current,rec))
+        if current:log_action(sync_sltp(client,key.split("|")[0],current,rec))
         else:
-            d={"trader":SOLE_SOURCE_PROFILE,"type":"source_close","position":p}
+            d={"trader":key.split("|")[0],"type":"source_close","position":p}
             state.setdefault("source_close_pending",{})[key]=d
             log_action(execute_source_close(client,d,rec,live,state))
         log_action(f"SYNC {key}: prior linked fill recovered and ownership confirmed")

@@ -1,9 +1,11 @@
-# Bybit booobsas mirror v3.4.0
+# Bybit booobsas mirror v3.5.0
 
-Sole source: booobsas, $100 to $1M portfolio. Base44 calls pollBooobsas every five minutes; source authentication and exchange API signing remain on the VPS. No LLM step is used for routine polling.
+Authorized sources: booobsas ($100 to $1M) and akira (Crypto). Base44 calls pollBooobsas every five minutes; source authentication and exchange API signing remain on the VPS. No LLM step is used for routine polling.
 
 Initial margin targets the source declared allocation percentage of the owner current USDT wallet, with matching leverage. The former 50% profile cap is removed. Mandatory exchange quantity precision, minimum notional, funds availability and position-netting conflicts can prevent an exact copy; no discretionary scaling-down is used. Existing source positions are baselined, never backfilled. Manual positions and WLD/short are protected. Entries already at least 3% profitable on source margin are skipped. Source quantity changes and SL/TP changes are synchronized.
 
 For a source-close event, close only if owner exit is net positive after estimated fees; otherwise retain the position and replace the bot-copied source SL with pending breakeven-floor protection. At a favorable 0.4% price move beyond fee-adjusted breakeven, activate a 1% price trail clamped to the breakeven floor. Long stops never move down; short stops never move up. The local code-only manager runs independently of the five-minute source poll and persists state. Live-source SL/TP remains mirrored; retention applies when a source close is processed. Fees, funding, liquidation, price gaps and slippage can still cause losses.
 
 Tests: `python tests/run_offline.py`, three isolated offline suites. Credentials must only be in the VPS root-owned .env. Do not embed GitHub credentials in repository URLs or print environment values. The state-preserving updater pauses the listener for a consistent backup, tests before restart, verifies the runtime version and rolls back code on failure. Legacy GitHub scheduled polling is disabled.
+
+Profiles share the owner available wallet budget. New-profile existing positions are baselined independently; source books, ownership keys and cursors are isolated by profile. Same-symbol position conflicts are skipped rather than netted or scaled. Low-credit account notifications remain one activity-only daily digest, plus urgent deduplicated risk alerts. Four offline suites currently contain 95 checks.
