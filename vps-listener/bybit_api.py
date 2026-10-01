@@ -267,7 +267,12 @@ class BybitClient:
             "stopLoss": format(Decimal(str(stop_loss)),"f") if stop_loss else "0",
             "takeProfit": format(Decimal(str(take_profit)),"f") if take_profit else "0",
         }
-        return self._post("/v5/position/set-trading-stop", body)
+        try:
+            return self._post("/v5/position/trading-stop", body)
+        except BybitError as e:
+            if "34040" in str(e):
+                return {}
+            raise
 
     def set_trailing_stop(self, symbol: str, active_price: float, trailing_distance: float,
                           position_idx: int = 0) -> dict:
@@ -279,7 +284,7 @@ class BybitClient:
             "trailingStop": f"{trailing_distance}",
             "activePrice": f"{active_price}",
         }
-        return self._post("/v5/position/set-trading-stop", body)
+        return self._post("/v5/position/trading-stop", body)
 
 
 def position_idx(symbol: str, side: str) -> int:
