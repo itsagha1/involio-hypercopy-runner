@@ -171,4 +171,29 @@ ok(listener.health()['ok'] is True,'transient blip right after a good snapshot s
 listener.ACCOUNT_CACHE['ok_ts']=time.time()-400
 ok(listener.health()['ok'] is False and 'ConnectTimeout' in listener.health()['bybit']['error'],'persistent exchange failure surfaces in status')
 listener.ACCOUNT_CACHE['error']=None
+
+# retained trailing params (owner 2026-10-02: 0.5% beyond BE, 0.5% trail) + /status exposure
+import copy as _copy
+st=empty();p=pos(ticker='SOL',side='long',ep=100,cp=100,lev=10,alloc_pct=1)
+rec={'symbol':'SOLUSDT','side':'long','qty':1.0,'entry_price':100.0,'price_target':120.0}
+st['mirrored']['booobsas|SOL/long|ret-1']=rec
+c=FakeClient(wallet=400,avail=400);c.ticker_prices['SOLUSDT']=99.0
+c.live_positions=[{'symbol':'SOLUSDT','side':'Buy','size':'1.0','avgPrice':'100.0'}]
+txt=listener.execute_source_close(c,{'trader':'booobsas','position':pos(cp=99.0,side='long',sid='ret-1')},rec,{'SOL/long':{'size':'1.0','avgPrice':'100.0'}},st)
+ok(txt.startswith('TRAIL RETAINED'),'losing source close still retained')
+rr=st['retained_trailing']['booobsas|SOL/long|ret-1']
+import math as _m
+ok(_m.isclose(rr['activation_threshold'],100*1.0012*1.005,rel_tol=1e-9),'activation threshold = +0.5% beyond fee BE')
+c.ticker_prices['SOLUSDT']=100.55
+listener.manage_retained_trailing_stops(c,st)
+ok(st['retained_trailing']['booobsas|SOL/long|ret-1']['status']=='pending','below 100.62 stays pending')
+c.ticker_prices['SOLUSDT']=101.0
+listener.manage_retained_trailing_stops(c,st)
+rt=st['retained_trailing']['booobsas|SOL/long|ret-1']
+ok(rt['status']=='active','activates beyond 0.5% threshold')
+ok(rt['current_sl']==100.50 and rt['current_sl']>=100.12,'trail SL = best-0.5% floored at BE (tick-rounded)')
+listener.STATE_FILE=listener.STATE_FILE  # keep path
+listener.save_state(st)
+h=listener.health()
+ok(any(r['key'].endswith('ret-1') and r['current_sl']==rt['current_sl'] for r in h['retained']),'/status exposes retained trailing positions')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED')

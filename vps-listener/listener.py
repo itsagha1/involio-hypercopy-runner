@@ -49,8 +49,8 @@ PROFIT_SKIP_ROI = 0.03            # rule: skip new trades already >= +3% source 
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
 MARGIN_CAP = 1.0                  # owner budget: FULL current wallet balance (1.0)
 FEE_BUFFER = 0.0012               # 0.12% roundtrip fee allowance for breakeven activation
-ACTIVATION_OFFSET = 0.004        # +0.4% beyond fee-adjusted BE threshold for activation
-TRAILING_DIST_PCT = 0.01         # 1% price trailing distance
+ACTIVATION_OFFSET = 0.005        # +0.5% beyond fee-adjusted BE threshold for activation (owner 2026-10-02)
+TRAILING_DIST_PCT = 0.005        # 0.5% price trailing distance (owner 2026-10-02)
 PREPARE_MAX_AGE_SECONDS = 600    # 10 minutes max age for cutover arming after prepare
 MISMATCH_MIN_USDT = 2.0          # orphan/mismatch reporting sensitivity
 MISMATCH_QTY_FRAC = 0.05         # excess qty tolerance (5% of live qty)
@@ -765,7 +765,7 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
 def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -> List[str]:
     """Local 2-second code-only manager for retained bot-owned positions.
     Ratchets exchange hard SL = max(BE, best*.99) long / min(BE, best*1.01) short.
-    Pending until +0.4% beyond fee-adjusted BE threshold.
+    Pending until +0.5% beyond fee-adjusted BE threshold; 0.5% trailing distance.
     Avoids placing invalid SL while price is below floor.
     """
     logs = []
@@ -1246,6 +1246,10 @@ def health():
             "cutover_armed":state.get("cutover_armed",False),"hold_new":state.get("hold_new",True),
             "baseline_count":len(state.get("baseline",[])),"baseline_positions":len(state.get("baseline",[])),
             "mirrored":state.get("mirrored",{}),"manual":state.get("manual",[]),"orphans":state.get("orphans",{}),"mismatches":state.get("mismatches",{}),
+            "retained":[{"key":k,"symbol":r.get("symbol"),"side":r.get("side"),"qty":r.get("qty"),"status":r.get("status"),
+                "fee_be":r.get("fee_be"),"activation_threshold":r.get("activation_threshold"),"best_price":r.get("best_price"),
+                "current_sl":r.get("current_sl"),"retained_at":r.get("retained_at")}
+                for k,r in state.get("retained_trailing",{}).items()],
             "retained_trailing":state.get("retained_trailing",{}),"last_webhook":state.get("last_webhook"),"last_processed":state.get("last_processed"),
             "books":{k:len(v.get("positions",[])) for k,v in state.get("books",{}).items()},"log_tail":log_tail(),
             "errors_last_run":state.get("errors_last_run",0),"risk_manager_alive":bool(RISK_TASK and not RISK_TASK.done()),"risk_interval_seconds":2}
