@@ -99,20 +99,24 @@ class BybitClient:
     def _post(self, path: str, body: dict) -> dict:
         if not self.configured:
             raise BybitError("Bybit keys not configured in .env")
-        ts = str(int(time.time() * 1000))
-        raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-        headers = {
-            "X-BAPI-API-KEY": self.key,
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": RECV_WINDOW,
-            "X-BAPI-SIGN": self._sign(ts, raw),
-        }
-        try:
-            r=self.session.post(self.base+path,data=raw.encode(),headers=headers,timeout=20)
-            r.raise_for_status()
-            return self._check(r.json(),path)
-        except (requests.RequestException,ValueError) as e:
-            raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None
+        for attempt in range(3):
+            ts = str(int(time.time() * 1000))
+            raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+            headers = {
+                "X-BAPI-API-KEY": self.key,
+                "X-BAPI-TIMESTAMP": ts,
+                "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+                "X-BAPI-SIGN": self._sign(ts, raw),
+            }
+            try:
+                r=self.session.post(self.base+path,data=raw.encode(),headers=headers,timeout=25)
+                r.raise_for_status()
+                return self._check(r.json(),path)
+            except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+                if attempt < 2: time.sleep(3); continue
+                raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None
+            except (requests.RequestException, ValueError) as e:
+                raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None
 
     # ---------- market data ----------
 
@@ -271,7 +275,12 @@ class BybitClient:
             "stopLoss": format(Decimal(str(stop_loss)),"f") if stop_loss else "0",
             "takeProfit": format(Decimal(str(take_profit)),"f") if take_profit else "0",
         }
-        return self._post("/v5/position/set-trading-stop", body)
+        try:
+            return self._post("/v5/position/trading-stop", body)
+        except BybitError as e:
+            if "34040" in str(e):
+                return {}
+            raise
 
     def set_trailing_stop(self, symbol: str, active_price: float, trailing_distance: float,
                           position_idx: int = 0) -> dict:
@@ -283,7 +292,7 @@ class BybitClient:
             "trailingStop": f"{trailing_distance}",
             "activePrice": f"{active_price}",
         }
-        return self._post("/v5/position/set-trading-stop", body)
+        return self._post("/v5/position/trading-stop", body)
 
 
 def position_idx(symbol: str, side: str) -> int:
