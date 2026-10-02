@@ -1,6 +1,6 @@
 """Offline safety regressions. No exchange requests, credentials or orders."""
 from __future__ import annotations
-import os,sys,tempfile,asyncio,json,copy
+import os,sys,tempfile,asyncio,json,copy,time
 from datetime import datetime,timezone
 os.environ['DRY_RUN']='false';os.environ['WEBHOOK_SHARED_SECRET']='testsecret'
 sys.path.insert(0,os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,4 +132,43 @@ try:
  module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
  ok(module.LISTENER_VERSION==listener.LISTENER_VERSION,'service starts with protected root-only env supplied by systemd')
 finally:dotenv.load_dotenv=saved_loader
+# --- Status cache & flaky-proxy regressions ---
+import requests as _rq
+class _Resp:
+    def __init__(self,data):self._d=data
+    def raise_for_status(self):pass
+    def json(self):return self._d
+_calls={'n':0}
+class _Session:
+    def get(self,*a,**k):
+        _calls['n']+=1
+        if _calls['n']==1:raise _rq.exceptions.ReadTimeout()
+        return _Resp({'retCode':0,'retMsg':'OK','result':{'list':[{'coin':[{'walletBalance':'402'}]}]}})
+cl=bybit_api.BybitClient(api_key='k',api_secret='s');cl.session=_Session()
+ok(cl._get('/v5/account/wallet-balance',{'accountType':'UNIFIED'}) is not None and _calls['n']==2,'flaky proxy read retried once then succeeded')
+class _DeadSession:
+    def get(self,*a,**k):
+        _calls['n']+=1;raise _rq.exceptions.ConnectTimeout()
+cl2=bybit_api.BybitClient(api_key='k',api_secret='s');cl2.session=_DeadSession()
+try:cl2._get('/v5/account/wallet-balance',{});ok(False,'dead proxy must fail')
+except bybit_api.BybitError as e:ok('ConnectTimeout' in str(e),'persistent proxy failure raises after retry')
+# refresh throttle
+class _C:
+    def __init__(self):self.n=0
+    def get_account_summary(self):self.n+=1;return {'wallet_balance':400,'available_balance':380,'margin_balance':400,'unrealised_pnl':0.1}
+    def get_positions(self):return [{'symbol':'SOLUSDT','size':'0.4'}]
+listener.ACCOUNT_CACHE.update({'ok_ts':0.0,'attempt_ts':0.0,'account':{},'positions':[],'error':None})
+fc=_C();listener.refresh_account_cache(fc);listener.refresh_account_cache(fc)
+ok(fc.n==1,'account cache refresh throttled inside window')
+ok(listener.ACCOUNT_CACHE['account']['wallet_balance']==400 and listener.ACCOUNT_CACHE['positions'][0]['symbol']=='SOLUSDT','cache stores account and positions')
+# /status serves cache without calling Bybit even after failures
+h=listener.health()
+ok(h['ok'] is True and h['bybit']['positions'][0]['symbol']=='SOLUSDT' and h['bybit']['age_seconds'] is not None,'/status serves cached snapshot with age')
+ok(h['margin']['wallet']==400,'/status margin figures come from cache')
+# persistent error surfaces only after stale window
+listener.ACCOUNT_CACHE['error']='Bybit read transport failure: ConnectTimeout';listener.ACCOUNT_CACHE['ok_ts']=time.time()
+ok(listener.health()['ok'] is True,'transient blip right after a good snapshot stays silent')
+listener.ACCOUNT_CACHE['ok_ts']=time.time()-400
+ok(listener.health()['ok'] is False and 'ConnectTimeout' in listener.health()['bybit']['error'],'persistent exchange failure surfaces in status')
+listener.ACCOUNT_CACHE['error']=None
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED')

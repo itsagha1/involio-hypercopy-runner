@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 import threading
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from starlette.concurrency import run_in_threadpool
@@ -1223,18 +1224,22 @@ async def cutover_config(req: CutoverConfigRequest, x_signature: str = Header(de
 @app.get("/health")
 @app.get("/status")
 def health():
-    state=load_state();client=BybitClient();account={};positions=[];error=None
-    if not DRY_RUN and client.configured:
-        try:
-            account=client.get_account_summary()
-            positions=[p for p in client.get_positions() if float(p.get("size") or 0)>0]
-        except BybitError as e:error=str(e)
+    # Serve the risk loop's cached account snapshot. This endpoint never calls
+    # Bybit directly, so a slow or flaky exchange proxy can never stall it.
+    state=load_state();client=BybitClient()
+    account=ACCOUNT_CACHE.get("account") or {};positions=ACCOUNT_CACHE.get("positions") or []
+    age=time.time()-ACCOUNT_CACHE["ok_ts"] if ACCOUNT_CACHE.get("ok_ts") else None
+    # Surface an exchange error only when it persisted past the retry window,
+    # never on a single transient blip.
+    error=None
+    if ACCOUNT_CACHE.get("error") and (not ACCOUNT_CACHE.get("ok_ts") or time.time()-ACCOUNT_CACHE["ok_ts"]>300):
+        error=ACCOUNT_CACHE["error"]
     wallet=account.get("wallet_balance");avail=account.get("available_balance")
     return {"ok":error is None,"status":"ok" if error is None else "error",
             "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"multi_profile_full_balance",
             "sole_source_profile":None,"authorized_profiles":sorted(AUTHORIZED_PROFILES),"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
             "proxy":"set" if os.environ.get("BYBIT_PROXY") else "missing","bybit_configured":client.configured,
-            "wallet_balance":wallet,"available_balance":avail,"bybit":{"balance":account.get("margin_balance"),"positions":positions,**({"error":error} if error else {})},
+            "wallet_balance":wallet,"available_balance":avail,"bybit":{"balance":account.get("margin_balance"),"positions":positions,"age_seconds":(round(age) if age is not None else None),**({"error":error} if error else {})},
             "margin":{"wallet":wallet,"available":avail,"cap_ratio":MARGIN_CAP,"budget":max(0,(wallet or 0)-profile_allocated_margin(state)),
                       "used":profile_allocated_margin(state),"cap_pct_used":100*profile_allocated_margin(state)/wallet if wallet else 0,
                       "margin_balance":account.get("margin_balance"),"unrealised_pnl":account.get("unrealised_pnl")},
@@ -1312,11 +1317,36 @@ def recover_parked_entries(client,state):
         log_action(f"SYNC {key}: prior linked fill recovered and ownership confirmed")
     save_state(state)
 
+# Cached Bybit account snapshot refreshed by the risk loop. The /status
+# endpoint serves this cache so monitoring never blocks on a slow or flaky
+# exchange proxy; a hung Bybit call can never stall health checks.
+ACCOUNT_CACHE: Dict[str, Any] = {"ok_ts": 0.0, "attempt_ts": 0.0, "account": {}, "positions": [], "error": None}
+ACCOUNT_REFRESH_S = 15.0
+ACCOUNT_RETRY_S = 5.0
+
+def refresh_account_cache(client: BybitClient) -> None:
+    now=time.time()
+    window=ACCOUNT_RETRY_S if ACCOUNT_CACHE["error"] else ACCOUNT_REFRESH_S
+    if now-ACCOUNT_CACHE["attempt_ts"] < window:
+        return
+    ACCOUNT_CACHE["attempt_ts"]=now
+    try:
+        account=client.get_account_summary()
+        positions=[p for p in client.get_positions() if float(p.get("size") or 0)>0]
+        ACCOUNT_CACHE["account"]=account
+        ACCOUNT_CACHE["positions"]=positions
+        ACCOUNT_CACHE["error"]=None
+        ACCOUNT_CACHE["ok_ts"]=now
+    except BybitError as e:
+        ACCOUNT_CACHE["error"]=str(e)
+
 def risk_tick():
+    client=BybitClient()
+    if client.configured and not DRY_RUN:
+        refresh_account_cache(client)
     with STATE_LOCK:
         state=load_state()
         if DRY_RUN or not (state.get("retained_trailing") or state.get("parked_ambiguous")):return
-        client=BybitClient()
         if not client.configured:raise BybitError("Bybit credentials missing")
         if state.get("parked_ambiguous"):recover_parked_entries(client,state)
         for line in manage_retained_trailing_stops(client,state):log_action(line)
