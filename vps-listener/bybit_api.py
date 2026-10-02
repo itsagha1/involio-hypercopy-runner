@@ -77,9 +77,7 @@ class BybitClient:
     def _get(self, path: str, params: dict) -> dict:
         if not self.configured:
             raise BybitError("Bybit keys not configured in .env")
-        # Idempotent read: retry once on transient proxy timeouts; a fresh
-        # timestamp and signature are computed per attempt.
-        for attempt in range(2):
+        for attempt in range(3):
             ts = str(int(time.time() * 1000))
             qs = urllib.parse.urlencode(params)
             headers = {
@@ -89,15 +87,14 @@ class BybitClient:
                 "X-BAPI-SIGN": self._sign(ts, qs),
             }
             try:
-                r=self.session.get(self.base+path+"?"+qs,headers=headers,timeout=20)
+                r=self.session.get(self.base+path+"?"+qs,headers=headers,timeout=25)
                 r.raise_for_status()
                 return self._check(r.json(),path)
-            except (requests.Timeout,requests.ConnectionError) as e:
-                if attempt==0:continue
+            except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+                if attempt < 2: time.sleep(3); continue
                 raise BybitError("Bybit read transport failure: "+type(e).__name__) from None
-            except (requests.RequestException,ValueError) as e:
+            except (requests.RequestException, ValueError) as e:
                 raise BybitError("Bybit read transport failure: "+type(e).__name__) from None
-        raise BybitError("Bybit read transport failure: retry exhausted")
 
     def _post(self, path: str, body: dict) -> dict:
         if not self.configured:
