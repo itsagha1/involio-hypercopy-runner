@@ -48,11 +48,24 @@ class BybitClient:
             except OSError:
                 pass
         proxy = proxy or os.environ.get("BYBIT_PROXY", "")
+        fallbacks = [p.strip() for p in os.environ.get("BYBIT_PROXY_FALLBACKS", "").split(",") if p.strip()]
+        self._proxy_pool = ([proxy] if proxy else []) + [f for f in fallbacks if f != proxy]
+        self._proxy_idx = 0
         self.base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.session = requests.Session()
-        if proxy:
-            self.session.proxies = {"http": proxy, "https": proxy}
+        if self._proxy_pool:
+            self.session.proxies = {"http": self._proxy_pool[0], "https": self._proxy_pool[0]}
         self.session.headers["Content-Type"] = "application/json"
+
+    def _rotate_proxy(self) -> bool:
+        """Switch to the next whitelisted proxy endpoint. Returns True if a
+        different endpoint became active (caller should retry on it)."""
+        if len(self._proxy_pool) < 2:
+            return False
+        self._proxy_idx = (self._proxy_idx + 1) % len(self._proxy_pool)
+        nxt = self._proxy_pool[self._proxy_idx]
+        self.session.proxies = {"http": nxt, "https": nxt}
+        return True
 
     @property
     def configured(self) -> bool:
@@ -91,7 +104,9 @@ class BybitClient:
                 r.raise_for_status()
                 return self._check(r.json(),path)
             except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
-                if attempt < 2: time.sleep(3); continue
+                if attempt < 2:
+                    self._rotate_proxy()
+                    time.sleep(3); continue
                 raise BybitError("Bybit read transport failure: "+type(e).__name__) from None
             except (requests.RequestException, ValueError) as e:
                 raise BybitError("Bybit read transport failure: "+type(e).__name__) from None
@@ -113,7 +128,9 @@ class BybitClient:
                 r.raise_for_status()
                 return self._check(r.json(),path)
             except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
-                if attempt < 2: time.sleep(3); continue
+                if attempt < 2:
+                    self._rotate_proxy()
+                    time.sleep(3); continue
                 raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None
             except (requests.RequestException, ValueError) as e:
                 raise BybitError("Bybit write transport outcome uncertain: "+type(e).__name__) from None

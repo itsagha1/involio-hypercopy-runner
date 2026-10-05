@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.5.2"
+LISTENER_VERSION = "v3.6.0"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -679,7 +679,8 @@ def sync_sltp(client: BybitClient, trader: str, p: Dict[str, Any], rec: Dict[str
 
 
 def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[str, Any],
-                         open_mirrors: Dict[str, Dict[str, Any]], state: Dict[str, Any]) -> str:
+                         open_mirrors: Dict[str, Dict[str, Any]], state: Dict[str, Any],
+                         bybit_ok: bool = True) -> str:
     """Source close rule:
     1. Check OWNER net exit PnL after estimated fees (FEE_BUFFER = 0.0012) using live Bybit ticker price.
     2. If net positive after fees: market close immediately and remove mirror.
@@ -693,6 +694,12 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
     pos = open_mirrors.get(coin + "/" + side)
 
     if pos is None:
+        if not bybit_ok:
+            # Bybit position poll failed this cycle (proxy/API timeout): an empty
+            # open_mirrors does NOT prove the position is gone. Keep the ownership
+            # record; source_close_pending will retry the close on the next poll.
+            return (f"SKIP {key} source_close: Bybit position poll unavailable - "
+                    f"mirror record kept, will retry next cycle")
         if key in state.get("mirrored", {}):
             del state["mirrored"][key]
         if key in state.get("retained_trailing", {}):
@@ -1103,7 +1110,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                 if DRY_RUN or not client.configured:
                     log_action(f"DRY_RUN :: WOULD CLOSE/TRAIL {k}")
                 else:
-                    action = execute_source_close(client, d, rec, open_mirrors, state)
+                    action = execute_source_close(client, d, rec, open_mirrors, state, bybit_ok=bybit_ok)
                     if action.startswith(("CLOSED", "TRAIL RETAINED")):
                         executed += 1
                     elif action.startswith("ERROR"):
@@ -1287,8 +1294,24 @@ def recover_parked_entries(client,state):
     for key,intent in list(state.get("parked_ambiguous",{}).items()):
         link=intent.get("order_link_id")
         if not link:continue
-        order=client.get_linked_order(intent["symbol"],link)
-        if not order or order.get("orderStatus") not in ("Filled","Cancelled","PartiallyFilledCanceled","Rejected"):continue
+        try:
+            order=client.get_linked_order(intent["symbol"],link)
+        except BybitError as e:
+            log_action(f"WARN {key}: parked recovery API error ({e}); retry next tick")
+            continue
+        if not order or order.get("orderStatus") not in ("Filled","Cancelled","PartiallyFilledCanceled","Rejected"):
+            pos=intent.get("position",{});created=pos.get("created_at","")
+            if created:
+                try:
+                    import datetime as _dt
+                    ct=_dt.datetime.fromisoformat(created.replace("Z","+00:00"))
+                    if (_dt.datetime.now(_dt.timezone.utc)-ct).total_seconds()>86400:
+                        state.setdefault("baseline",[]).append(baseline_id(key.split("|")[0],pos))
+                        state["parked_ambiguous"].pop(key,None)
+                        log_action(f"LOG {key}: parked entry stale (>24h, order not found); cleared")
+                        continue
+                except Exception: pass
+            continue
         filled=float(order.get("cumExecQty") or 0)
         p=intent["position"];bk=p["ticker"]+"/"+p["side"]
         if filled<=0:

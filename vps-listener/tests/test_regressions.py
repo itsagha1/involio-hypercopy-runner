@@ -197,3 +197,37 @@ listener.save_state(st)
 h=listener.health()
 ok(any(r['key'].endswith('ret-1') and r['current_sl']==rt['current_sl'] for r in h['retained']),'/status exposes retained trailing positions')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED')
+
+# --- owner 2026-10-05 directive: an unavailable Bybit poll must NEVER consume a source close ---
+st_sc=empty()
+rec_sc={'symbol':'SOLUSDT','side':'long','qty':1.0,'entry_price':100.0,'price_target':120.0}
+key_sc='booobsas|SOL/long|stale-1'
+st_sc['mirrored'][key_sc]=rec_sc
+c_sc=FakeClient(wallet=400,avail=400)
+d_sc={'trader':'booobsas','position':pos(cp=101.0,side='long',sid='stale-1')}
+txt_sc=listener.execute_source_close(c_sc,d_sc,rec_sc,{},st_sc,bybit_ok=False)
+ok(txt_sc.startswith('SKIP'),'poll-failure source close is deferred (SKIP), never consumed')
+ok(key_sc in st_sc['mirrored'],'mirror record kept when Bybit position poll unavailable')
+ok(c_sc.orders==[] ,'no orders placed while deferring a close on failed poll')
+txt_sc2=listener.execute_source_close(c_sc,d_sc,rec_sc,{},st_sc,bybit_ok=True)
+ok(txt_sc2.startswith('LOG'),'verified-missing position still cleans up stale record')
+ok(key_sc not in st_sc['mirrored'],'stale record removed only after a verified poll')
+
+# --- owner 2026-10-05: optional multi-proxy failover (BYBIT_PROXY_FALLBACKS) ---
+_bk={k:os.environ.get(k) for k in ('BYBIT_PROXY','BYBIT_PROXY_FALLBACKS')}
+os.environ['BYBIT_PROXY']='http://proxy-a:1'
+os.environ['BYBIT_PROXY_FALLBACKS']='http://proxy-a:1,http://proxy-b:2,http://proxy-c:3'
+cl_p=bybit_api.BybitClient(api_key='k',api_secret='s')
+ok(cl_p._proxy_pool==['http://proxy-a:1','http://proxy-b:2','http://proxy-c:3'],'deduped proxy pool built from env')
+ok(cl_p.session.proxies['https']=='http://proxy-a:1','primary proxy active first')
+ok(cl_p._rotate_proxy() is True,'rotation reports a change when fallbacks exist')
+ok(cl_p.session.proxies['https']=='http://proxy-b:2','rotation moves to first fallback')
+cl_p._rotate_proxy();cl_p._rotate_proxy()
+ok(cl_p.session.proxies['https']=='http://proxy-a:1','rotation wraps around the pool')
+os.environ['BYBIT_PROXY_FALLBACKS']=''
+cl_p1=bybit_api.BybitClient(api_key='k',api_secret='s')
+ok(cl_p1._rotate_proxy() is False and cl_p1.session.proxies['https']=='http://proxy-a:1','single proxy: rotation is a no-op')
+for _k,_v in _bk.items():
+    if _v is None: os.environ.pop(_k,None)
+    else: os.environ[_k]=_v
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.0)')
