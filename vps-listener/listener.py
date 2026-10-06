@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.1"
+LISTENER_VERSION = "v3.6.2"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -417,6 +417,15 @@ def detect_unmanaged(state: Dict[str, Any], open_mirrors: Dict[str, Dict[str, An
                                                MISMATCH_QTY_FRAC * qty * price):
             mismatches.append((bk, qty, expected))
     return orphans, mismatches
+
+
+def persist_unmanaged(state: Dict[str, Any], orphans, mismatches) -> None:
+    """Keep the latest orphan/mismatch findings on state so /status and the
+    alert collector can report untracked live positions instead of silently
+    dropping the per-cycle detection result."""
+    state["orphans"] = {bk: {"qty": qty} for bk, qty in orphans}
+    state["mismatches"] = {bk: {"qty": qty, "expected": expected}
+                           for bk, qty, expected in mismatches}
 
 
 # ---------------------------------------------------------------- actions
@@ -1002,6 +1011,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
         # Orphan & mismatch detection
         if bybit_ok:
             orphans, mismatches = detect_unmanaged(state, open_mirrors)
+            persist_unmanaged(state, orphans, mismatches)
             if not state.get("manual_adopted"):
                 for bk, qty in orphans:
                     if bk not in state["manual"]:

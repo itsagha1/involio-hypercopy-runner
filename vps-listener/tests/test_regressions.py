@@ -256,3 +256,20 @@ class _DeadClient(FakeClient):
 txt_de,_=listener.open_mirror(_DeadClient(),'booobsas',p_dl,bk_dl['booobsas'],st_dl)
 ok(txt_de.startswith('ERROR'),'non-10001 errors still surface as ERROR')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.1 guard)')
+
+# --- owner 2026-10-07: orphan detection must persist to state so /status + alert collector see it (ALGO incident) ---
+st_or=empty()
+st_or['mirrored']={'booobsas|SOL/long|s1':{'qty':'1','symbol':'SOLUSDT','side':'long'}}
+st_or['manual']=['XRP/short']
+open_mirrors={
+    'SOL/long':{'size':'3','side':'Buy','avgPrice':'100'},      # tracked but qty exceeds -> mismatch
+    'ALGO/short':{'size':'109.9','side':'Sell','avgPrice':'0.12'}, # untracked, not manual -> orphan
+    'XRP/short':{'size':'500','side':'Sell','avgPrice':'2'},    # manual -> ignored
+}
+orph,mis=listener.detect_unmanaged(st_or,open_mirrors)
+ok([o[0] for o in orph]==['ALGO/short'],'untracked non-manual live position detected as orphan')
+ok([m[0] for m in mis]==['SOL/long'],'excess tracked qty detected as mismatch')
+listener.persist_unmanaged(st_or,orph,mis)
+ok(st_or['orphans']=={'ALGO/short':{'qty':109.9}},'orphans persisted to state in /status shape {qty}')
+ok(st_or['mismatches']=={'SOL/long':{'qty':3.0,'expected':1.0}},'mismatches persisted to state in /status shape {qty,expected}')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.2 orphans)')
