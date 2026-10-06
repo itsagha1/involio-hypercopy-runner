@@ -331,6 +331,10 @@ def coin_to_symbol(coin: str) -> str:
         return "1000PEPEUSDT"
     if c in ("KBONK", "1000BONK"):
         return "1000BONKUSDT"
+    if c in ("KFLOKI", "1000FLOKI"):
+        return "1000FLOKIUSDT"
+    if c in ("KSHIB", "SHIB1000", "1000SHIB"):
+        return "SHIB1000USDT"
     if c == "PUMP":
         return "PUMPFUNUSDT"
     if c.endswith("USDT"):
@@ -344,6 +348,10 @@ def symbol_to_coin(symbol: str) -> str:
         return "kPEPE"
     if s in ("1000BONKUSDT", "1000BONK"):
         return "kBONK"
+    if s in ("1000FLOKIUSDT", "1000FLOKI"):
+        return "kFLOKI"
+    if s in ("SHIB1000USDT", "SHIB1000"):
+        return "kSHIB"
     if s in ("PUMPFUNUSDT", "PUMPFUN"):
         return "PUMP"
     if s.endswith("USDT"):

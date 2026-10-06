@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.0"
+LISTENER_VERSION = "v3.6.1"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 

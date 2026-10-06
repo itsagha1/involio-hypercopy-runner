@@ -231,3 +231,12 @@ for _k,_v in _bk.items():
     if _v is None: os.environ.pop(_k,None)
     else: os.environ[_k]=_v
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.0)')
+
+# --- owner 2026-10-06: kSHIB aliases to Bybit's SHIB1000USDT contract; kFLOKI mapping kept ---
+import bybit_api as _ba2
+ok(_ba2.coin_to_symbol('kSHIB')=='SHIB1000USDT','kSHIB maps to SHIB1000USDT')
+ok(_ba2.coin_to_symbol('SHIB1000')=='SHIB1000USDT','SHIB1000 maps to SHIB1000USDT')
+ok(_ba2.symbol_to_coin('SHIB1000USDT')=='kSHIB','SHIB1000USDT maps back to kSHIB')
+ok(_ba2.coin_to_symbol('kFLOKI')=='1000FLOKIUSDT' and _ba2.symbol_to_coin('1000FLOKIUSDT')=='kFLOKI','kFLOKI mapping intact')
+ok(_ba2.coin_to_symbol('kBONK')=='1000BONKUSDT' and _ba2.coin_to_symbol('kPEPE')=='1000PEPEUSDT','existing k-coin mappings intact')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.1)')
