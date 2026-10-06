@@ -452,6 +452,11 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
             if l_qty > 0:
                 return f"SKIP {key} new_entry: owner live position conflict on Bybit for {symbol}/{side}", None
     except BybitError as e:
+        # Bybit retCode 10001 = symbol not delisted tradeable on linear market:
+        # a clean SKIP (not a repeating ERROR that would spam account-risk alerts)
+        if "retCode=10001" in str(e) or "symbol not exist" in str(e):
+            return (f"SKIP {key} new_entry: symbol delisted on Bybit (retCode=10001) - "
+                    f"cannot mirror non-existent symbol"), None
         return f"ERROR {key} new_entry: cannot verify live position ownership: {e}", None
 
     # Source ROI profit skip check (+3% on margin)

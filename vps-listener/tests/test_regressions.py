@@ -240,3 +240,19 @@ ok(_ba2.symbol_to_coin('SHIB1000USDT')=='kSHIB','SHIB1000USDT maps back to kSHIB
 ok(_ba2.coin_to_symbol('kFLOKI')=='1000FLOKIUSDT' and _ba2.symbol_to_coin('1000FLOKIUSDT')=='kFLOKI','kFLOKI mapping intact')
 ok(_ba2.coin_to_symbol('kBONK')=='1000BONKUSDT' and _ba2.coin_to_symbol('kPEPE')=='1000PEPEUSDT','existing k-coin mappings intact')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.1)')
+
+# --- delisted-symbol guard: retCode 10001 must SKIP cleanly, not spam ERROR ---
+class _NoSymClient(FakeClient):
+    def get_positions(self,sym=None):
+        raise bybit_api.BybitError('/v5/position/list -> retCode=10001 retMsg=symbol not exist')
+st_dl=empty()
+p_dl=pos(ticker='FOO',side='long',sid='dl-1')
+bk_dl=make_book([p_dl])
+txt_dl,_=listener.open_mirror(_NoSymClient(),'booobsas',p_dl,bk_dl['booobsas'],st_dl)
+ok(txt_dl.startswith('SKIP') and 'delisted' in txt_dl,'retCode=10001 on entry -> clean delisted SKIP')
+class _DeadClient(FakeClient):
+    def get_positions(self,sym=None):
+        raise bybit_api.BybitError('Bybit read transport failure: ReadTimeout')
+txt_de,_=listener.open_mirror(_DeadClient(),'booobsas',p_dl,bk_dl['booobsas'],st_dl)
+ok(txt_de.startswith('ERROR'),'non-10001 errors still surface as ERROR')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.1 guard)')
