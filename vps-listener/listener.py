@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.7.0"
+LISTENER_VERSION = "v3.7.1"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
 
@@ -116,6 +116,15 @@ def load_state() -> Dict[str, Any]:
                 s = json.load(f)
             s.setdefault("version", STATE_VERSION)
             s.setdefault("baseline", [])
+            # v3.7.1 hardening: legacy ad-hoc fixes once appended raw position dicts to
+            # the baseline list. A single dict crashes set() the next time a NEW profile
+            # is baselined. Keep only string entries; closed-source positions need no
+            # baseline exclusion, so dropping them is safe (re-opens mirror as new trades).
+            _bl = s.get("baseline")
+            if isinstance(_bl, list) and any(not isinstance(x, str) for x in _bl):
+                dropped = [x.get("ticker", "?") if isinstance(x, dict) else x for x in _bl if not isinstance(x, str)]
+                s["baseline"] = [x for x in _bl if isinstance(x, str)]
+                log_action(f"BASELINE SANITIZED: dropped {len(dropped)} legacy non-string entr(ies): {dropped}")
             s.setdefault("mirrored", {})
             s.setdefault("retained_trailing", {})
             s.setdefault("books", {})

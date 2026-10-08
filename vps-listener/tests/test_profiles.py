@@ -116,3 +116,15 @@ try:source_api.normalize_source(wrong_oz,[raw_oz],sims_oz,'oozypath')
 except source_api.SourceDataError:ok(True,'different OOZYPATH portfolio fails closed')
 else:raise AssertionError('wrong oozypath portfolio accepted')
 print('ALL '+str(PASS)+' PROFILE CHECKS PASSED (v3.7.0 oozypath)')
+
+# --- v3.7.1: legacy dict in baseline must never crash a new profile baseline ---
+legacy={'mirrored':{},'manual':[],'manual_adopted':True,'fresh_start_at':books([])['snapshot_at'],
+ 'hold_new':True,'cutover_armed':True,'hold_new':True,
+ 'baseline':[{'ticker':'ONDO','side':'long','source_id':'legacy-dict'},'booobsas|kept-str']}
+listener.save_state(legacy)
+r=asyncio.run(listener.involio_delta(listener.WebhookPayload(source='test',books={'oozypath':books([oz1])},hold_new=True),x_signature='testsecret'))
+st=listener.load_state()
+ok(r['ok'] and 'oozypath|oz-btc' in st['baseline'],'new profile baselines despite legacy dict in state')
+ok(not any(isinstance(x,dict) for x in st['baseline']),'legacy dict entry dropped from baseline')
+ok('booobsas|kept-str' in st['baseline'],'string baseline entries preserved through sanitization')
+print('ALL '+str(PASS)+' PROFILE CHECKS PASSED (v3.7.1 sanitize)')
