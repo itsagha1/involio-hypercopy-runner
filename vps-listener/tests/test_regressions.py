@@ -288,10 +288,20 @@ class _RetFake(FakeClient):
         self.ticker_prices['LINKUSDT']=13.5
         self.live=[{'symbol':'LINKUSDT','size':str(live_size),'side':'Buy','avgPrice':'13.37'}]
     def get_positions(self,symbol=None):return self.live
+# owner ADD keeps protection: trailing recalculates on the new total (rule 2026-10-08)
 st_r=empty();key_r=_mk_retained(st_r,0.7)
 logs_r=_L.manage_retained_trailing_stops(_RetFake(3.0),st_r)
-ok(any(l.startswith('DEREGISTER '+key_r) and 'owner took over' in l for l in logs_r),'owner add on retained -> quiet DEREGISTER handover')
+ok(any(l.startswith('TRAIL RESIZED '+key_r) and 'trailing continues on total' in l for l in logs_r),'owner add on retained -> TRAIL RESIZED, protection kept')
 ok(not any(l.startswith('ERROR') for l in logs_r),'owner add on retained -> no ERROR risk alert')
-ok('LINK/long' in st_r['manual'],'position moved to manual list on relinquish')
-ok(key_r not in st_r['mirrored'] and key_r not in st_r['retained_trailing'],'records cleaned up on relinquish')
-print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.3 relinquish)')
+ok(st_r['mirrored'][key_r]['qty']==3.0 and st_r['retained_trailing'][key_r]['qty']==3.0,'qty updated to new total in both records')
+ok(abs(st_r['retained_trailing'][key_r]['fee_be']-(13.37*1.0012))<1e-9,'BE floor rebuilt from blended avg entry 13.37')
+ok(abs(st_r['retained_trailing'][key_r]['activation_threshold']-(13.37*1.0012*1.005))<1e-9,'activation threshold recalculated from new BE floor')
+ok('LINK/long' not in st_r['manual'] and key_r in st_r['mirrored'],'records kept, NOT moved to manual on add')
+# owner REDUCE: quiet handover to manual
+st_r2=empty();key_r2=_mk_retained(st_r2,0.7)
+logs_r2=_L.manage_retained_trailing_stops(_RetFake(0.3),st_r2)
+ok(any(l.startswith('DEREGISTER '+key_r2) and 'reduced externally' in l for l in logs_r2),'owner reduce on retained -> quiet DEREGISTER handover')
+ok(not any(l.startswith('ERROR') for l in logs_r2),'owner reduce on retained -> no ERROR risk alert')
+ok('LINK/long' in st_r2['manual'],'position moved to manual list on reduce')
+ok(key_r2 not in st_r2['mirrored'] and key_r2 not in st_r2['retained_trailing'],'records cleaned up on reduce')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.4 retained resize)')

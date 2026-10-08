@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.3"
+LISTENER_VERSION = "v3.6.4"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -816,10 +816,35 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
             expected = float(state.get("mirrored", {}).get(key, {}).get("qty") or ret.get("qty") or 0)
             actual = float(pos.get("size") or 0)
             if abs(actual-expected) > max(1e-9,expected*1e-6):
+                if actual > expected:
+                    # Owner rule 2026-10-08: a manual ADD to a retained position keeps bot
+                    # protection. Trailing stop recalculates on the new total: BE floor is
+                    # rebuilt from the blended average entry (avgPrice) and exchange BE.
+                    avg = float(pos.get("avgPrice") or 0)
+                    exchange_be = float(pos.get("breakEvenPrice") or 0)
+                    if side == "long":
+                        new_be = max(avg*(1.0+FEE_BUFFER), exchange_be) if avg > 0 else ret["fee_be"]
+                    else:
+                        new_be = min(avg*(1.0-FEE_BUFFER), exchange_be) if avg > 0 else ret["fee_be"]
+                    old_be = ret["fee_be"]
+                    ret["qty"] = actual
+                    rec = state.get("mirrored", {}).get(key)
+                    if rec is not None:
+                        rec["qty"] = actual
+                        if avg > 0:
+                            rec["entry"] = avg
+                    ret["fee_be"] = new_be
+                    ret["activation_threshold"] = (new_be*(1.0+ACTIVATION_OFFSET) if side == "long"
+                                                   else new_be*(1.0-ACTIVATION_OFFSET))
+                    if ret.get("status") != "active":
+                        ret["best_price"] = None
+                    logs.append(f"TRAIL RESIZED {key}: owner added {actual-expected:g} (bot had {expected:g}, live now {actual:g}); BE floor {old_be:g} -> {new_be:g}, trailing continues on total")
+                    continue
+                # manual REDUCE: owner scaling out; quiet handover to manual
                 state.setdefault("manual", []).append(coin+"/"+side)
                 retained_dict.pop(key,None)
                 state.get("mirrored",{}).pop(key,None)
-                logs.append(f"DEREGISTER {key}: retained position size changed externally (owner took over; bot had {expected}, live now {actual}); moved {coin}/{side} to manual, trailing protection abandoned")
+                logs.append(f"DEREGISTER {key}: retained position reduced externally (bot had {expected:g}, live now {actual:g}); moved {coin}/{side} to manual")
                 continue
             exchange_be = float(pos.get("breakEvenPrice") or ret["fee_be"])
             ret["fee_be"] = max(ret["fee_be"],exchange_be) if side == "long" else min(ret["fee_be"],exchange_be)
