@@ -23,7 +23,7 @@ import urllib.parse
 
 import requests
 
-RECV_WINDOW = "5000"
+RECV_WINDOW = "15000"
 
 
 class BybitError(Exception):

@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.4"
+LISTENER_VERSION = "v3.6.5"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -1422,7 +1422,7 @@ async def risk_loop():
     while True:
         try:await run_in_threadpool(risk_tick)
         except asyncio.CancelledError:raise
-        except Exception as e:log_action(f"ERROR risk manager: {type(e).__name__}; exchange stops preserved")
+        except Exception as e:log_action(f"ERROR risk manager: {type(e).__name__}: {e}; exchange stops preserved")
         await asyncio.sleep(2)
 
 @app.on_event("startup")
