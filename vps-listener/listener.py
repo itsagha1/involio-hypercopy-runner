@@ -41,9 +41,9 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.5"
+LISTENER_VERSION = "v3.7.0"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
-AUTHORIZED_PROFILES = {"booobsas", "akira"}
+AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
 
 PROFIT_SKIP_ROI = 0.03            # rule: skip new trades already >= +3% source ROI on margin
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
@@ -59,7 +59,7 @@ LOG_TAIL_LINES = 60
 STATE_LOCK = threading.RLock()
 RISK_TASK = None
 
-app = FastAPI(title="Bybit mirror v3.5: booobsas and akira Crypto")
+app = FastAPI(title="Bybit mirror v3.7: booobsas, akira Crypto, oozypath")
 
 
 class WebhookPayload(BaseModel):

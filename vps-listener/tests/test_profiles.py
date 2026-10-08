@@ -89,3 +89,30 @@ except Exception as ex:ok('503' in str(ex),'persistent source failure still fail
 else:raise AssertionError('persistent failure was served')
 finally:asyncio.sleep=real_sleep;sa.fetch_source_book=orig
 print('ALL '+str(PASS)+' PROFILE CHECKS PASSED')
+
+# --- owner 2026-10-08: third authorized profile oozypath (portfolio 2f5cb886..., title OOZYPATH) ---
+oz1=pos(ticker='BTC',side='long',sid='oz-btc',sq=0.01,lev=30,ep=83559.8,cp=82351)
+oz2=pos(ticker='ASTER',side='long',sid='oz-aster',sq=100,lev=4,ep=0.714,cp=0.706)
+triple={'booobsas':books([b]),'akira':books([a]),'oozypath':books([oz1,oz2])}
+st={'books':{'booobsas':books([b]),'akira':books([a])},'baseline':['old-boo-baseline'],'mirrored':{},'manual':[],
+ 'manual_adopted':True,'fresh_start_at':books([])['snapshot_at'],'hold_new':True,'cutover_armed':True}
+listener.save_state(st); f=FakeClient(); listener.BybitClient=lambda:f
+r=asyncio.run(listener.involio_delta(listener.WebhookPayload(source='test',books=triple,hold_new=True),x_signature='testsecret'))
+st=listener.load_state()
+ok(r['ok'] and 'oozypath|oz-btc' in st['baseline'] and 'oozypath|oz-aster' in st['baseline'],'first OOZYPATH snapshot baselines both existing positions')
+ok(not f.orders,'OOZYPATH profile addition sends no backfill order')
+ok('old-boo-baseline' in st['baseline'],'existing baselines preserved when adding OOZYPATH')
+d=listener.compute_deltas(listener.load_state()['books'],{'booobsas':books([b]),'akira':books([a]),'oozypath':books([oz1,oz2,pos(ticker='XRP',side='short',sid='oz-new',sq=50,lev=10)])})
+ok(any(x['trader']=='oozypath' and x['type']=='new_entry' and x['position']['source_id']=='oz-new' for x in d),'future OOZYPATH trade eligible after baseline')
+ok(not any(x['trader']=='oozypath' and x['position']['source_id']=='oz-btc' for x in d),'baselined OOZYPATH positions never mirror')
+# Source identity: the OOZYPATH portfolio id itself, not another portfolio of the same user.
+meta_oz={'success':True,'portfolio':{'id':source_api.PROFILES['oozypath'],'owner':{'username':'oozypath'},'openPositions':1},'source_portfolio_id':source_api.PROFILES['oozypath']}
+raw_oz={'baseId':'oz1','portfolio':{'id':source_api.PROFILES['oozypath']},'isOpen':True,'entrySim':100,'entrySize':1,'leverage':30,'entryPrice':83559.8,'currentPrice':82351,'directionLong':True,'ticker':'BTC'}
+sims_oz={'success':True,'investments':[{'baseId':'oz1','entrySim':100,'lastSim':100}],'portfolioRemainingSim':389.4}
+book_oz=source_api.normalize_source(meta_oz,[raw_oz],sims_oz,'oozypath')
+ok(book_oz['source_profile']=='oozypath' and book_oz['positions'][0]['leverage']==30,'OOZYPATH declaration and profile identity verified')
+wrong_oz=copy.deepcopy(meta_oz);wrong_oz['portfolio']['id']='other-portfolio'
+try:source_api.normalize_source(wrong_oz,[raw_oz],sims_oz,'oozypath')
+except source_api.SourceDataError:ok(True,'different OOZYPATH portfolio fails closed')
+else:raise AssertionError('wrong oozypath portfolio accepted')
+print('ALL '+str(PASS)+' PROFILE CHECKS PASSED (v3.7.0 oozypath)')
