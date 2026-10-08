@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.6.2"
+LISTENER_VERSION = "v3.6.3"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira"}
 
@@ -819,7 +819,7 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
                 state.setdefault("manual", []).append(coin+"/"+side)
                 retained_dict.pop(key,None)
                 state.get("mirrored",{}).pop(key,None)
-                logs.append(f"ERROR {key}: position size changed outside bot; relinquished ownership without orders")
+                logs.append(f"DEREGISTER {key}: retained position size changed externally (owner took over; bot had {expected}, live now {actual}); moved {coin}/{side} to manual, trailing protection abandoned")
                 continue
             exchange_be = float(pos.get("breakEvenPrice") or ret["fee_be"])
             ret["fee_be"] = max(ret["fee_be"],exchange_be) if side == "long" else min(ret["fee_be"],exchange_be)

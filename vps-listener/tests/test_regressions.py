@@ -273,3 +273,25 @@ listener.persist_unmanaged(st_or,orph,mis)
 ok(st_or['orphans']=={'ALGO/short':{'qty':109.9}},'orphans persisted to state in /status shape {qty}')
 ok(st_or['mismatches']=={'SOL/long':{'qty':3.0,'expected':1.0}},'mismatches persisted to state in /status shape {qty,expected}')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.2 orphans)')
+
+# --- owner 2026-10-08: owner adding to a retained position must be a quiet DEREGISTER, not an ERROR risk alert (LINK incident) ---
+import listener as _L
+def _mk_retained(st,q):
+    key='booobsas|LINK/long|r1'
+    st['mirrored'][key]={'qty':q,'symbol':'LINKUSDT','side':'long'}
+    st.setdefault('retained_trailing',{})[key]={'symbol':'LINKUSDT','side':'long','qty':q,'status':'pending',
+                                   'fee_be':14.05,'activation_threshold':14.13,'best_price':13.4,'current_sl':None}
+    return key
+class _RetFake(FakeClient):
+    def __init__(self,live_size):
+        super().__init__()
+        self.ticker_prices['LINKUSDT']=13.5
+        self.live=[{'symbol':'LINKUSDT','size':str(live_size),'side':'Buy','avgPrice':'13.37'}]
+    def get_positions(self,symbol=None):return self.live
+st_r=empty();key_r=_mk_retained(st_r,0.7)
+logs_r=_L.manage_retained_trailing_stops(_RetFake(3.0),st_r)
+ok(any(l.startswith('DEREGISTER '+key_r) and 'owner took over' in l for l in logs_r),'owner add on retained -> quiet DEREGISTER handover')
+ok(not any(l.startswith('ERROR') for l in logs_r),'owner add on retained -> no ERROR risk alert')
+ok('LINK/long' in st_r['manual'],'position moved to manual list on relinquish')
+ok(key_r not in st_r['mirrored'] and key_r not in st_r['retained_trailing'],'records cleaned up on relinquish')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.3 relinquish)')
