@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.7.1"
+LISTENER_VERSION = "v3.7.2"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
 
@@ -628,6 +628,15 @@ def sync_size(client: BybitClient, trader: str, p: Dict[str, Any], rec: Dict[str
     if curr_sq == last_sq:
         return f"LOG {key} size: source_qty unchanged ({curr_sq})"
 
+    # v3.7.2: sub-nano source-qty deltas are float noise from the source API
+    # (e.g. 5.66e-16). Snap the record so the delta does not re-fire every cycle,
+    # and return None so the caller logs nothing and does not touch the exchange.
+    if abs(curr_sq - last_sq) <= max(1e-9, 1e-9 * curr_sq):
+        rec["last_applied_source_qty"] = curr_sq
+        rec["desired_source_qty"] = curr_sq
+        save_state(state)
+        return None
+
     ratio = curr_sq / last_sq
 
     try:
@@ -892,7 +901,13 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
                 rounding = ROUND_CEILING if side == "long" else ROUND_FLOOR
                 rounded_sl = float((Decimal(str(intended_sl))/grid).to_integral_value(rounding=rounding)*grid)
                 if (side=="long" and rounded_sl>=cp) or (side=="short" and rounded_sl<=cp):
-                    logs.append(f"ERROR {key}: intended protective floor crossed before exchange update; existing stops preserved")
+                    # v3.7.2: benign only when a stop is already live on the exchange
+                    # (the JUP 2026-10-09 case: prior notch still protected the position).
+                    # Alert-free LOG; keep ERROR when no stop exists (genuinely at risk).
+                    if ret.get("current_sl"):
+                        logs.append(f"LOG {key}: protective floor crossed before exchange update; existing stop {ret['current_sl']} still protects")
+                    else:
+                        logs.append(f"ERROR {key}: intended protective floor crossed before exchange update and no existing stop")
                     continue
                 prev_sl = ret.get("current_sl")
 
@@ -1132,6 +1147,8 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     log_action(f"DRY_RUN :: WOULD SYNC size {k}")
                 else:
                     action = sync_size(client, d["trader"], p, rec, state)
+                    if action is None:
+                        continue
                     if action.startswith(("ADDED", "REDUCED")):
                         executed += 1
                     elif action.startswith("ERROR"):
@@ -1176,8 +1193,9 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     desired_qty=float(p["source_qty"])
                     if not rec.get("leverage_blocked") and (rec.get("pending_resize") or desired_qty != float(rec.get("last_applied_source_qty") or desired_qty)):
                         action=sync_size(client,trader,p,rec,state)
-                        log_action(action)
-                        if action.startswith("ERROR"): errors+=1
+                        if action is not None:
+                            log_action(action)
+                            if action.startswith("ERROR"): errors+=1
                     if rec.get("sltp_pending") or rec.get("stop_loss")!=p.get("stop_loss") or rec.get("price_target")!=p.get("price_target"):
                         action=sync_sltp(client,trader,p,rec)
                         log_action(action)
@@ -1322,6 +1340,7 @@ async def source_snapshot(profile:str=SOLE_SOURCE_PROFILE,x_signature:str=Header
     from source_api import fetch_source_book, SourceDataError
     book=None
     try:
+        import requests as _rq
         for attempt in range(3):
             try:
                 book=await run_in_threadpool(fetch_source_book,profile)
@@ -1329,6 +1348,13 @@ async def source_snapshot(profile:str=SOLE_SOURCE_PROFILE,x_signature:str=Header
             except SourceDataError:
                 # Transient source-side inconsistency (counts/pages changing mid-fetch).
                 # Fresh full refetch after a short pause; only give up after the third attempt.
+                if attempt==2:raise
+                await asyncio.sleep(2+attempt*2)
+            except _rq.exceptions.RequestException:
+                # v3.7.2: transport blips (5xx from Involio, proxy resets, read timeouts)
+                # are usually gone within seconds. Retry with backoff before surfacing
+                # an ERROR that would page the owner (e.g. the 2026-10-09 02:35-02:50 UTC outage
+                # produced one ERROR per profile per poll instead of absorbing single blips).
                 if attempt==2:raise
                 await asyncio.sleep(2+attempt*2)
         return {"ok":True,"book":book}

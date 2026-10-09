@@ -128,3 +128,38 @@ ok(r['ok'] and 'oozypath|oz-btc' in st['baseline'],'new profile baselines despit
 ok(not any(isinstance(x,dict) for x in st['baseline']),'legacy dict entry dropped from baseline')
 ok('booobsas|kept-str' in st['baseline'],'string baseline entries preserved through sanitization')
 print('ALL '+str(PASS)+' PROFILE CHECKS PASSED (v3.7.1 sanitize)')
+
+# --- v3.7.2: float-noise source-qty delta snaps and returns None (no exchange call) ---
+noise_state={'mirrored':{'t|FIL/short|x':{'symbol':'FILUSDT','side':'short','qty':5.1,
+  'last_applied_source_qty':5.1+5.66e-16,'desired_source_qty':5.1}},'manual':[],'manual_adopted':True}
+listener.save_state(noise_state)
+class _NoCall:
+    configured=True
+    def __getattr__(self,n): raise AssertionError('client must not be touched for noise delta')
+a=listener.sync_size(_NoCall(),'t',{'ticker':'FIL','side':'short','source_id':'x','source_qty':5.1},
+                     noise_state['mirrored']['t|FIL/short|x'],noise_state)
+ok(a is None,'float-noise delta returns None (no log, no exchange call)')
+ok(abs(noise_state['mirrored']['t|FIL/short|x']['last_applied_source_qty']-5.1)<1e-15,'noise snapped: last_applied equals source qty')
+
+# --- v3.7.2: benign ratchet race (existing stop) logs LOG not ERROR; no stop stays ERROR ---
+class _RaceClient:
+    configured=True
+    def get_ticker(self,s): return {'lastPrice':100.0}
+    def get_instrument(self,s): return {'tickSize':'0.01','minQty':0.1,'qtyStep':0.1}
+    def position(self,s): return {}
+    def get_positions(self):
+        return [{'symbol':'FILUSDT','side':'Sell','size':5.1,'avgPrice':2.0}]
+    def get_linked_order(self,s,l): return None
+race_state={'mirrored':{'t2|FIL/short|y':{'symbol':'FILUSDT','side':'short','qty':5.1}},
+ 'retained_trailing':{'t2|FIL/short|y':{'key':'t2|FIL/short|y','symbol':'FILUSDT','side':'short','qty':5.1,
+  'owner_entry_price':3.0,'fee_be':3.0,'activation_threshold':2.98,'status':'active',
+  'best_price':2.95,'current_sl':2.99,'price_target':None}},'manual':[],'manual_adopted':True}
+listener.save_state(race_state)
+logs=listener.manage_retained_trailing_stops(_RaceClient(),race_state)
+ok(any(l.startswith('LOG') and 'still protects' in l for l in logs),'race with existing stop -> benign LOG')
+ok(not any(l.startswith('ERROR') for l in logs),'race with existing stop -> no ERROR alert')
+race_state['retained_trailing']['t2|FIL/short|y']['current_sl']=None
+listener.save_state(race_state)
+logs=listener.manage_retained_trailing_stops(_RaceClient(),race_state)
+ok(any(l.startswith('ERROR') and 'no existing stop' in l for l in logs),'race without stop -> still ERROR alert')
+print('ALL '+str(PASS)+' PROFILE CHECKS PASSED (v3.7.2 resilience)')
