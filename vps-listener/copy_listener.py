@@ -20,6 +20,7 @@ Config via environment (per-instance root-owned env file):
 from __future__ import annotations
 
 import asyncio
+import threading
 import hashlib
 import json
 import math
@@ -548,7 +549,7 @@ POLL_TASK = None
 @app.on_event("startup")
 async def start_poll():
     global POLL_TASK
-    POLL_TASK = asyncio.create_task(asyncio.to_thread(poll_loop_sync))
+    threading.Thread(target=poll_loop_sync, name="copy-poll", daemon=True).start()
 
 
 @app.on_event("shutdown")
