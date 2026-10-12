@@ -41,7 +41,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.7.2"
+LISTENER_VERSION = "v3.7.3"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
 
@@ -438,6 +438,61 @@ def persist_unmanaged(state: Dict[str, Any], orphans, mismatches) -> None:
 
 
 # ---------------------------------------------------------------- actions
+
+def sanitize_stale_state(state: Dict[str, Any]) -> List[str]:
+    """v3.7.3 owner directive (2026-10-12): stale tracking entries must clean themselves up.
+
+    A manual-protect entry is stale once the owner holds no Bybit position of that coin/side
+    AND no authorized source book holds it; protection self-recreates on any future owner
+    conflict or manual touch, so dropping it is safe (and unblocks fresh mirroring).
+    WLD/short stays permanently protected by the hard-coded skip rule in the entry path.
+    entry_blocks are per-source-trade skip dedup records: once the trade id is absent from
+    every book and no mirror exists for the key, the block is dead weight.
+    """
+    held_pairs = set()
+    held_ids = set()
+    for book in state.get("books", {}).values():
+        for q in book.get("positions", []):
+            held_pairs.add((str(q.get("ticker", "")).upper(), str(q.get("side", "")).lower()))
+            held_ids.add(str(q.get("source_id", "")))
+    bybit_pairs = None
+    if not ACCOUNT_CACHE.get("error") and ACCOUNT_CACHE.get("ok_ts") and time.time() - ACCOUNT_CACHE["ok_ts"] < 600:
+        bybit_pairs = set()
+        for q in ACCOUNT_CACHE.get("positions") or []:
+            if float(q.get("size") or 0) <= 0:
+                continue
+            coin = symbol_to_coin(str(q.get("symbol", "")))
+            side_raw = str(q.get("side", "")).lower()
+            side = "long" if side_raw == "buy" else "short" if side_raw == "sell" else ""
+            bybit_pairs.add((coin.upper(), side))
+    logs = []
+    if bybit_pairs is not None:
+        keep = []
+        pruned = []
+        for m in state.get("manual", []):
+            parts = m.split("/")
+            key = (parts[0].upper(), parts[1].lower()) if len(parts) == 2 else None
+            if key is None or key in held_pairs or key in bybit_pairs:
+                keep.append(m)
+            else:
+                pruned.append(m)
+        if pruned:
+            state["manual"] = keep
+            logs.append(f"LOG STALE-CLEAN: pruned {len(pruned)} manual-protect entr(ies) held by neither owner nor sources: {pruned}")
+    pruned_blocks = []
+    blocks = state.setdefault("entry_blocks", {})
+    for k in list(blocks.keys()):
+        parts = k.split("|")
+        if len(parts) != 3:
+            continue
+        if parts[2] in held_ids or k in state.get("mirrored", {}):
+            continue
+        del blocks[k]
+        pruned_blocks.append(k)
+    if pruned_blocks:
+        logs.append(f"LOG STALE-CLEAN: pruned {len(pruned_blocks)} entry_blocks of closed source trades")
+    return logs
+
 
 def order_link(key,operation,generation=0):
     return "BC"+hashlib.sha256((key+"|"+operation+"|"+str(generation)).encode()).hexdigest()[:32]
@@ -1210,6 +1265,8 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                             errors+=1;log_action(f"ERROR {k} leverage update: {e}")
 
         state["books"] = effective_books
+        for _line in sanitize_stale_state(state):
+            log_action(_line)
         state["last_webhook"] = payload.fired_at
         state["last_processed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         state["deltas_last_run"] = len(deltas)

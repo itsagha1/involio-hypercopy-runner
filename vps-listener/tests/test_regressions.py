@@ -305,3 +305,31 @@ ok(not any(l.startswith('ERROR') for l in logs_r2),'owner reduce on retained -> 
 ok('LINK/long' in st_r2['manual'],'position moved to manual list on reduce')
 ok(key_r2 not in st_r2['mirrored'] and key_r2 not in st_r2['retained_trailing'],'records cleaned up on reduce')
 print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.6.4 retained resize)')
+
+# --- v3.7.3 owner directive 2026-10-12: stale tracking entries must self-clean (stale UNI manual-protect incident) ---
+st_s=empty()
+st_s['books']={'booobsas':make_book([pos(ticker='ENA',side='short',sid='e1')])['booobsas']}
+st_s['manual']=['ENA/short','UNI/long','ETH/long','WLD/short']
+st_s['mirrored']={'booobsas|MIR/long|m1':{'qty':'1','symbol':'MIRUSDT','side':'long'}}
+st_s['entry_blocks']={
+ 'booobsas|ENA/short|e1':'SKIP held trade stays blocked',
+ 'booobsas|MIR/long|m1':'LOG mirror already exists or parked ambiguous - repeated entry blocked',
+ 'booobsas|UNI/long|dead-1':'SKIP manual protect active for UNI/long (never manage owner manual positions)',
+ 'booobsas|WLD/short|dead-2':'SKIP manual protect active for WLD/short (never manage owner manual positions)',
+}
+listener.ACCOUNT_CACHE.update({'error':None,'ok_ts':time.time(),'positions':[{'symbol':'ETHUSDT','size':'0.1','side':'Buy'}]})
+logs_s=listener.sanitize_stale_state(st_s)
+ok(st_s['manual']==['ENA/short','ETH/long'],'stale manual pruned, source-held and bybit-held kept')
+ok('UNI/long' not in st_s['manual'] and 'WLD/short' not in st_s['manual'],'stale manual protect (incl WLD/short) pruned; WLD protection stays via hard-coded entry rule')
+ok(set(st_s['entry_blocks'])=={'booobsas|ENA/short|e1','booobsas|MIR/long|m1'},'entry_blocks kept for held/mirrored keys, pruned for closed trades')
+ok(any('STALE-CLEAN' in l and 'manual' in l for l in logs_s) and any('entry_blocks' in l for l in logs_s),'cleanup logged as silent LOG lines')
+# conservative: stale Bybit cache must never prune manual entries
+listener.ACCOUNT_CACHE.update({'error':'Bybit read failed','ok_ts':time.time()-9999,'positions':[]})
+st_c=empty()
+st_c['books']={'booobsas':make_book([pos(ticker='ENA',side='short',sid='e1')])['booobsas']}
+st_c['manual']=['UNI/long']
+st_c['entry_blocks']={'booobsas|UNI/long|dead-9':'SKIP closed'}
+logs_c=listener.sanitize_stale_state(st_c)
+ok(st_c['manual']==['UNI/long'],'stale account cache -> manual pruning skipped entirely')
+ok(st_c['entry_blocks']=={},'entry_blocks pruned regardless (book-based only)')
+print('ALL '+str(PASS)+' REGRESSION CHECKS PASSED (v3.7.3 stale-state self-clean)')
