@@ -245,6 +245,20 @@ class BybitClient:
             if matches:return matches[0]
         return None
 
+
+    def ensure_hedge_mode(self) -> bool:
+        """Switch account to hedge mode so positionIdx 1/2 orders are accepted.
+        Fresh subaccounts default to one-way mode; retCode 10001 'position idx
+        not match position mode' on order create means this is needed.
+        Idempotent: 'same as current' counts as success."""
+        try:
+            self._post("/v5/position/switch-mode", {"category": "linear", "mode": 3})
+            return True
+        except BybitError as e:
+            if "same as current" in str(e) or "110043" in str(e):
+                return True
+            raise
+
     def place_order(self,symbol,side,qty,position_idx=0,reduce_only=False,order_link_id=None):
         body={"category":"linear","symbol":symbol,"side":side,"orderType":"Market","qty":str(qty),"positionIdx":position_idx}
         if reduce_only:body["reduceOnly"]=True

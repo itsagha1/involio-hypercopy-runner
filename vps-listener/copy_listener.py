@@ -44,7 +44,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.0"
+APP_VERSION = "c1.0.2"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
 PORT = int(os.environ.get("COPY_PORT", "8001"))
@@ -229,7 +229,7 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
 
         client.set_leverage(symbol, lev)
         requested_qty = qty
-        fill = client.place_order(symbol, bybit_side(side), qty,
+        fill = place_order_mode_safe(client, symbol, bybit_side(side), qty,
                                   position_idx=position_idx(symbol, side),
                                   order_link_id=order_link(key, "open"))
         qty = float(fill.get("filled_qty") or qty)
@@ -284,7 +284,7 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
             if delta * float(client.get_ticker(symbol)["lastPrice"]) / lev > avail * MAX_AVAIL_PER_TRADE:
                 rec["desired_source_qty"] = curr_sq
                 return f"SKIP {key} size_add: insufficient available balance - target kept for retry"
-            client.place_order(symbol, bybit_side(side), delta, position_idx=idx,
+            place_order_mode_safe(client, symbol, bybit_side(side), delta, position_idx=idx,
                                order_link_id=order_link(key, "add", int(rec.get("gen", 0))))
             rec["qty"] = rec["qty"] + delta
             action = f"ADDED {key} 100% follow: +{delta} (now {rec['qty']}, source qty {curr_sq:.6g})"
@@ -294,7 +294,7 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
                 rec["last_applied_source_qty"] = curr_sq
                 rec["desired_source_qty"] = curr_sq
                 return None
-            client.place_order(symbol, close_side(side), delta, position_idx=idx, reduce_only=True,
+            place_order_mode_safe(client, symbol, close_side(side), delta, position_idx=idx, reduce_only=True,
                                order_link_id=order_link(key, "reduce", int(rec.get("gen", 0))))
             rec["qty"] = max(0.0, rec["qty"] - delta)
             action = f"REDUCED {key} 100% follow: -{delta} (now {rec['qty']}, source qty {curr_sq:.6g})"
@@ -340,7 +340,7 @@ def follow_source_close(client: BybitClient, p: Dict[str, Any], rec: Dict[str, A
             return f"CLOSED {key}: position already flat on exchange; deregistered"
         inst = client.get_instrument(symbol)
         qty = round_qty(qty, inst)
-        client.place_order(symbol, close_side(side), qty, position_idx=position_idx(symbol, side),
+        place_order_mode_safe(client, symbol, close_side(side), qty, position_idx=position_idx(symbol, side),
                            reduce_only=True, order_link_id=order_link(key, "close", int(rec.get("gen", 0))))
         return (f"CLOSED {key} 100% follow: source closed"
                 f"{' at source ROI %+.2f%%' % (roi * 100) if roi is not None else ''} "
@@ -501,7 +501,31 @@ def poll_once() -> None:
     save_state(state)
 
 
+def place_order_mode_safe(client, symbol, side, qty, position_idx, reduce_only=False, order_link_id=None):
+    """place_order with one self-healing retry: if the account is in one-way
+    mode (retCode 10001 'position idx not match position mode'), switch to
+    hedge mode and retry once."""
+    try:
+        return client.place_order(symbol, side, qty, position_idx=position_idx,
+                                  reduce_only=reduce_only, order_link_id=order_link_id)
+    except BybitError as e:
+        if "position mode" in str(e) or "10001" in str(e):
+            client.ensure_hedge_mode()
+            return client.place_order(symbol, side, qty, position_idx=position_idx,
+                                      reduce_only=reduce_only, order_link_id=order_link_id)
+        raise
+
+
 def poll_loop_sync() -> None:
+    # One-time setup: ensure the account is in hedge mode so positionIdx 1/2
+    # orders are accepted (fresh subaccounts default to one-way mode).
+    try:
+        c = BybitClient()
+        if c.configured and not DRY_RUN:
+            if c.ensure_hedge_mode():
+                log_action("SETUP ensured hedge position mode (positionIdx 1/2 ordering)")
+    except Exception as e:
+        log_action(f"ERROR ensure_hedge_mode: {type(e).__name__}: {e}")
     while True:
         try:
             poll_once()
