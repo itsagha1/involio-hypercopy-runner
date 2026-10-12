@@ -54,6 +54,7 @@ def main() -> int:
         os.path.join(VPS_TESTS_DIR, "test_cutover.py"),
         os.path.join(VPS_TESTS_DIR, "test_regressions.py"),
         os.path.join(VPS_TESTS_DIR, "test_profiles.py"),
+        os.path.join(VPS_TESTS_DIR, "test_copy_accounts.py"),
     ]
 
     total_passed = 0
