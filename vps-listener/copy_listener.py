@@ -523,7 +523,7 @@ def status():
         try:
             bybit["positions"] = [p for p in client.get_positions() if float(p.get("size") or 0) > 0]
             s = client.get_account_summary()
-            wallet = s.get("wallet")
+            wallet = s.get("wallet_balance")
         except BybitError as e:
             bybit["error"] = str(e)
     return {"ok": True, "code_version": APP_VERSION, "name": NAME, "profile": PROFILE,
