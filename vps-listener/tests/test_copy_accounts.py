@@ -214,10 +214,45 @@ ok(len(st['skip_watch']) == 0, 'poll 5: watch list cleared after auto-entry')
 
 book_v6 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01)]}
 copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v6)
-fake_client.live_positions = [{'symbol': 'SOLUSDT', 'size': str(list(st['mirrored'].values())[0]['qty']), 'side': 'Buy', 'avgPrice': '100'},
-                               {'symbol': 'DOGEUSDT', 'size': str(list(st['mirrored'].values())[1]['qty']), 'side': 'Buy', 'avgPrice': '100'}]
+fake_client.live_positions = [{'symbol': 'SOLUSDT', 'size': str(list(st['mirrored'].values())[0]['qty']), 'side': 'Buy', 'avgPrice': '100', 'markPrice': '105', 'breakEvenPrice': '100.12'},
+                               {'symbol': 'DOGEUSDT', 'size': str(list(st['mirrored'].values())[1]['qty']), 'side': 'Buy', 'avgPrice': '100', 'markPrice': '95', 'breakEvenPrice': '100.12'}]
 copy_listener.poll_once()
-ok(len(st['mirrored']) == 0, 'poll 6: all mirrored trades closed at market when sources close (100% follow)')
-ok(st['baseline'] == ['b1'], 'poll 6: baseline survives, only mirrors cleaned')
+ok(len(st['mirrored']) == 2, 'poll 6: sources missing poll 1/2 -> NO close yet (2-poll confirmation, owner 2026-10-13)')
+ok(st.get('source_missing') == {'s1': 1, 'd9': 1}, 'poll 6: missing counters at 1/2')
+ok(len(fake_client.orders) == 2, 'poll 6: no new orders during confirmation window')
+ok(st['baseline'] == ['b1'], 'poll 6: baseline survives')
 
-print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration)')
+# poll 7: sources still gone -> 2nd consecutive poll confirms source-lost.
+# SOL is +5% (profitable -> close at market); DOGE is -5% (losing -> retained + TP trigger).
+copy_listener.poll_once()
+ok(len(st['mirrored']) == 0, 'poll 7: confirmed source-lost trades deregistered from mirrored')
+ok(len([o for o in fake_client.orders if o.get('side') == 'Sell']) == 1, 'poll 7: profitable SOLUSDT closed at market (reduce-only)')
+ret = st.get('retained', {})
+ok(len(ret) == 1 and 'DOGE' in list(ret)[0], 'poll 7: losing DOGEUSDT retained (not closed)')
+doge_ret = list(ret.values())[0]
+ok(abs(doge_ret['tp_trigger'] - 100.62) < 1e-9, f"TP trigger at fee-BE 100.12 + 0.5% = 100.62 (got {doge_ret['tp_trigger']})")
+tp_calls = [x for x in fake_client.stops if x[0] == 'sltp' and x[2] == '0' and x[3] == '100.62']
+ok(len(tp_calls) == 1, 'exchange TP trigger placed with SL cancelled')
+
+# poll 8: retained position exits on the exchange (TP filled) -> bookkeeping cleaned up
+fake_client.live_positions = []
+copy_listener.poll_once()
+ok(len(st.get('retained', {})) == 0, 'poll 8: retained entry removed once exchange position is gone')
+
+# --- source reappears after 1 poll (API glitch) -> counter reset, mirroring resumes ---
+st = fresh_state()
+c2 = FakeClient(wallet=1000, avail=1000)
+c2.ticker_prices = {'SOLUSDT': '100'}
+copy_listener.BybitClient = lambda: c2
+st['mirrored']['testprof|SOL/long|g1'] = {'symbol': 'SOLUSDT', 'side': 'long', 'qty': 1.0, 'gen': 0, 'source_id': 'g1'}
+st['books'] = {'positions': [cpos('SOL', 'long', 'g1', roi=0.01)]}
+copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy({'positions': []})
+copy_listener.poll_once()
+ok(st.get('source_missing', {}).get('g1') == 1, 'glitch poll 1: counter at 1/2, no action')
+ok(len(st['mirrored']) == 1, 'glitch poll 1: mirror untouched')
+copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy({'positions': [cpos('SOL', 'long', 'g1', roi=0.01)]})
+copy_listener.poll_once()
+ok(st.get('source_missing', {}).get('g1') is None, 'glitch poll 2: source reappeared -> counter reset')
+ok(len(st['mirrored']) == 1, 'glitch poll 2: mirror still active, no close/retain')
+
+print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule 2026-10-13)')

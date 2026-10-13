@@ -3,7 +3,10 @@
 
 Owner spec 2026-10-12 (separate from the protected-mirror main listener):
 - Full copy of the bound profile: sizes, adds/reductions, SL/TP, leverage synced.
-- Source close is ALWAYS followed at market, including losses (no retention/trailing).
+- Source-lost rule (owner 2026-10-13): a mirrored trade whose source disappears from
+  the books for 2 consecutive polls (closed, lost, or unavailable) is treated as a
+  source close: profitable -> closed at market; losing -> retained with an exchange-side
+  TP trigger at fee-adjusted breakeven +/- 0.5% (exits at breakeven+ even if the bot dies).
 - New entries already at >= 2% source-margin ROI are skipped as "watch" candidates;
   each poll re-checks watched trades and opens at market once ROI < 2% again.
 - Existing positions at first run are baselined (never mirrored).
@@ -27,6 +30,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +48,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.2"
+APP_VERSION = "c1.0.3"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
 PORT = int(os.environ.get("COPY_PORT", "8001"))
@@ -56,6 +60,8 @@ LOG_FILE = os.environ.get("COPY_LOG_FILE", f"/var/lib/hypercopy-copy/{NAME}_acti
 STATE_LOCK = __import__("threading").Lock()
 
 PROFIT_SKIP_ROI = 0.02          # 2% profit-skip threshold (owner 2026-10-12)
+FEE_ALLOWANCE = 0.0012      # 0.12% roundtrip fee allowance for source-lost breakeven math
+TP_TRIGGER_OFFSET = 0.005  # +0.5% beyond fee-adjusted breakeven for the retained TP trigger
 MAX_LEVERAGE = 50
 MIN_NOTIONAL = 5.0
 MARGIN_CAP = 0.70               # guard: total margin cap of wallet (like main listener)
@@ -94,14 +100,15 @@ def load_state() -> Dict[str, Any]:
                     s = json.load(f)
                 for key, default in (("baseline", []), ("mirrored", {}), ("skip_watch", {}),
                                       ("manual", []), ("entry_blocks", {}), ("books", None),
-                                      ("last_poll", None), ("errors_last_run", 0), ("armed", False)):
+                                      ("last_poll", None), ("errors_last_run", 0), ("armed", False),
+                                      ("retained", {}), ("source_missing", {})):
                     s.setdefault(key, default)
                 return s
             except (json.JSONDecodeError, OSError):
                 pass
     return {"version": APP_VERSION, "baseline": [], "mirrored": {}, "skip_watch": {},
             "manual": [], "entry_blocks": {}, "books": None, "last_poll": None,
-            "errors_last_run": 0, "armed": False}
+            "errors_last_run": 0, "armed": False, "retained": {}, "source_missing": {}}
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -349,6 +356,67 @@ def follow_source_close(client: BybitClient, p: Dict[str, Any], rec: Dict[str, A
         return f"ERROR {key} follow_source_close: {e} - will retry next poll"
 
 
+def handle_source_lost(client: BybitClient, rec_key: str, state: Dict[str, Any]) -> str:
+    """Owner rule 2026-10-13 (source-lost, subaccounts): a mirrored trade whose source is
+    absent from the books 2 consecutive polls (closed, lost, or unavailable) is treated as
+    a source close. Profitable -> closed at market; losing -> retained with an exchange-side
+    TP trigger order at fee-adjusted breakeven +/- 0.5%, so the position exits at
+    breakeven+ even if the bot dies. Retained positions are deregistered from mirroring
+    and left to the exchange TP order; the TP trigger itself is never managed further."""
+    rec = state["mirrored"].get(rec_key)
+    if rec is None:
+        return f"LOG {rec_key} source-lost: mirror already gone; nothing to do"
+    symbol, side = rec["symbol"], rec["side"]
+    key = rec_key
+    try:
+        live = [lp for lp in client.get_positions(symbol)
+                if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                and float(lp.get("size") or 0) > 0]
+        lp = live[0] if live else None
+        if lp is None:
+            return f"SOURCE-LOST-CLOSED {key}: source gone 2 polls; position already flat on exchange; deregistered"
+        qty = float(lp["size"])
+        avg = float(lp.get("avgPrice") or 0)
+        mark = float(lp.get("markPrice") or avg)
+        direction = 1.0 if side == "long" else -1.0
+        notional = avg * qty
+        gross = (mark - avg) * direction * qty
+        net_return = (gross - notional * FEE_ALLOWANCE) / notional if notional > 0 else 0.0
+        if net_return >= 0.005:
+            # profitable -> close at market (100% copy behaviour for winning closes)
+            inst = client.get_instrument(symbol)
+            q = round_qty(min(qty, float(rec["qty"]) or qty), inst)
+            place_order_mode_safe(client, symbol, close_side(side), q,
+                                  position_idx=position_idx(symbol, side), reduce_only=True,
+                                  order_link_id=order_link(key, "lostclose", int(rec.get("gen", 0))))
+            return (f"SOURCE-LOST-CLOSED {key}: source gone 2 polls, net {net_return * 100:+.2f}% "
+                    f"-> closed at market (profitable)")
+        # losing -> retain with exchange-side TP trigger at fee-adjusted breakeven +/- 0.5%
+        fee_be = float(lp.get("breakEvenPrice") or 0)
+        if fee_be <= 0:
+            fee_be = avg * (1.0 + FEE_ALLOWANCE * direction)
+        tp = fee_be * (1.0 + TP_TRIGGER_OFFSET) if side == "long" else fee_be * (1.0 - TP_TRIGGER_OFFSET)
+        inst = client.get_instrument(symbol)
+        tick = float((inst.get("priceFilter") or {}).get("tickSize") or "0.01")
+        grid = Decimal(str(tick))
+        rounding = ROUND_FLOOR if side == "long" else ROUND_CEILING
+        tp = float((Decimal(str(tp)) / grid).to_integral_value(rounding=rounding) * grid)
+        src_tp = float(rec.get("price_target") or 0)
+        if src_tp > 0:
+            tp = max(src_tp, tp) if side == "long" else min(src_tp, tp)
+        client.set_sl_tp(symbol, stop_loss=0, take_profit=tp, position_idx=position_idx(symbol, side))
+        state.setdefault("retained", {})[key] = {
+            "symbol": symbol, "side": side, "qty": qty, "entry": avg,
+            "fee_be": fee_be, "tp_trigger": tp,
+            "retained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "source_id": rec.get("source_id")}
+        return (f"SOURCE-LOST-RETAINED {key}: source gone 2 polls, net {net_return * 100:+.2f}% "
+                f"-> retained with exchange TP trigger at {tp} (BE {fee_be:.6f}); "
+                f"exits at breakeven+ even if the bot dies")
+    except BybitError as e:
+        return f"ERROR {key} source-lost handling: {e} - will retry next poll"
+
+
 _GLOBAL_STATE: Dict[str, Any] = {"state": load_state()}
 
 
@@ -425,15 +493,31 @@ def poll_once() -> None:
         blocks = state.setdefault("entry_blocks", {})
         for k in [k for k in blocks if k.split("|")[-1] == sid]:
             del blocks[k]
-        if DRY_RUN or not client.configured:
-            continue
-        rec_key = next((k for k in state["mirrored"] if k.split("|")[-1] == sid), None)
-        if rec_key:
-            action = follow_source_close(client, prev_ids[sid], state["mirrored"][rec_key])
+
+    # --- source-lost rule (owner 2026-10-13): 2-poll confirmation over mirrors ---
+    # A mirrored trade whose source is absent from the CURRENT books increments a
+    # counter; 2 consecutive polls confirms the source close (protects against API
+    # glitches). Profitable -> close at market; losing -> retained with TP trigger.
+    missing = state.setdefault("source_missing", {})
+    for sid in list(missing):
+        if sid in by_id:
+            missing.pop(sid, None)
+    if not (DRY_RUN or not client.configured):
+        for rec_key in list(state["mirrored"].keys()):
+            sid = rec_key.split("|")[-1]
+            if sid in by_id:
+                continue
+            missing[sid] = int(missing.get(sid, 0)) + 1
+            if missing[sid] < 2:
+                log_action(f"SOURCE-MISSING {rec_key}: source absent from books "
+                           f"(poll {missing[sid]}/2); awaiting confirmation")
+                continue
+            action = handle_source_lost(client, rec_key, state)
             log_action(action)
             if action.startswith("ERROR"):
                 errors += 1
             else:
+                missing.pop(sid, None)
                 state["mirrored"].pop(rec_key, None)
 
     # --- re-evaluate watch list: auto re-entry when ROI drops below 2% ---
@@ -494,6 +578,23 @@ def poll_once() -> None:
         log_action(f"LOG STALE-CLEAN: pruned {len(pruned_m)} manual entr(ies) not held by source: {pruned_m}")
     for k in [k for k in state.setdefault("entry_blocks", {}) if k.split("|")[-1] not in held_ids and k not in state["mirrored"]]:
         del state["entry_blocks"][k]
+
+    # --- retained cleanup: drop retained bookkeeping once the exchange position is gone ---
+    retained = state.get("retained", {})
+    if retained and client.configured and not DRY_RUN:
+        live_pairs = set()
+        try:
+            for lp in client.get_positions():
+                if float(lp.get("size") or 0) > 0:
+                    live_pairs.add((lp.get("symbol"), "long" if lp.get("side") == "Buy" else "short"))
+        except BybitError as e:
+            errors += 1
+            log_action(f"ERROR retained cleanup: {e}")
+        for k, r in list(retained.items()):
+            if (r.get("symbol"), r.get("side")) not in live_pairs:
+                del retained[k]
+                log_action(f"RETAINED-EXITED {k}: exchange position gone "
+                           f"(TP trigger {r.get('tp_trigger')} filled or closed manually); deregistered")
 
     state["books"] = book
     state["last_poll"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -556,6 +657,8 @@ def status():
             "wallet": wallet, "bybit": bybit,
             "baseline_count": len(state.get("baseline", [])),
             "mirrored": state.get("mirrored", {}),
+            "retained": state.get("retained", {}),
+            "source_missing": state.get("source_missing", {}),
             "skip_watch": state.get("skip_watch", {}),
             "manual": state.get("manual", []),
             "log_tail": [l.strip() for l in log_tail(20)]}
