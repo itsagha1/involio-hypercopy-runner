@@ -159,12 +159,13 @@ def test_rules():
     p_late = pos(ep=100.0, cp=98.0, side="short", last_sim=104.0, entry_sim=100.0)
     st = listener.load_state()
     txt, rec = listener.open_mirror(c, "booobsas", p_late, make_book([p_late])["booobsas"], st)
-    ok(rec is None and "too late" in txt, "3% source ROI skip")
+    ok(rec is None and "SKIP-WATCH" in txt and "2%" in txt, "2% source ROI skip with watch (owner 2026-10-13)")
+    ok(len(st.get("skip_watch", {})) == 1, "skip registered in watch list")
 
-    # Position with +2% ROI on margin (last_sim=102, entry_sim=100) -> allowed
-    p_allow = pos(ep=100.0, cp=100.0, side="short", last_sim=102.0, entry_sim=100.0, sid="allow-1")
+    # Position with +1.5% ROI on margin (last_sim=101.5, entry_sim=100) -> allowed
+    p_allow = pos(ep=100.0, cp=100.0, side="short", last_sim=101.5, entry_sim=100.0, sid="allow-1")
     txt_a, rec_a = listener.open_mirror(c, "booobsas", p_allow, make_book([p_allow])["booobsas"], st)
-    ok(rec_a is not None and "OPENED" in txt_a, "+2% source ROI allowed")
+    ok(rec_a is not None and "OPENED" in txt_a, "+1.5% source ROI allowed")
 
     print("3. rule: 1:1 percentage margin allocation with full budget 1.0")
     p_norm = pos(sm=10.0, ep=120.0, cp=120.0, side="short", alloc_pct=10.0, sid="norm-1")  # 10% of 500 = 50 USDT margin

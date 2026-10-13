@@ -212,7 +212,7 @@ def test_cutover_rules():
     p_prof = pos(ticker="SOL", side="long", ep=100.0, cp=103.5, last_sim=103.5, entry_sim=100.0, sid="sol-prof")
     c_prof = FakeClient(avail=500.0, wallet=500.0)
     txt_prof, rec_prof = listener.open_mirror(c_prof, "booobsas", p_prof, book_info, st_run)
-    ok(rec_prof is None and "already +" in txt_prof and "source ROI" in txt_prof, f"+3.5% ROI skipped: {txt_prof}")
+    ok(rec_prof is None and "SKIP-WATCH" in txt_prof and "2%" in txt_prof, f"+3.5% ROI -> skip-watch (owner 2026-10-13): {txt_prof}")
 
     # Test 9: Size add follow based on stable source_qty
     print("\n9. Size add follow based on stable source_qty")

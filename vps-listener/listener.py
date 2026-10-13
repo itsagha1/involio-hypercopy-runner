@@ -41,11 +41,11 @@ STATE_FILE = os.environ.get("STATE_FILE", "vps_state.json")
 LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 
 STATE_VERSION = 3
-LISTENER_VERSION = "v3.7.3"
+LISTENER_VERSION = "v3.7.4"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
 
-PROFIT_SKIP_ROI = 0.03            # rule: skip new trades already >= +3% source ROI on margin
+PROFIT_SKIP_ROI = 0.02            # owner rule 2026-10-13: skip new trades already >= +2% source ROI on margin, with auto re-entry watch below 2%
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
 MARGIN_CAP = 1.0                  # owner budget: FULL current wallet balance (1.0)
 FEE_BUFFER = 0.0012               # 0.12% roundtrip fee allowance for breakeven activation
@@ -127,6 +127,8 @@ def load_state() -> Dict[str, Any]:
                 log_action(f"BASELINE SANITIZED: dropped {len(dropped)} legacy non-string entr(ies): {dropped}")
             s.setdefault("mirrored", {})
             s.setdefault("retained_trailing", {})
+            s.setdefault("skip_watch", {})
+            s.setdefault("source_missing", {})
             s.setdefault("books", {})
             s.setdefault("last_webhook", None)
             s.setdefault("fresh_start_at", None)
@@ -532,11 +534,13 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
                     f"cannot mirror non-existent symbol"), None
         return f"ERROR {key} new_entry: cannot verify live position ownership: {e}", None
 
-    # Source ROI profit skip check (+3% on margin)
+    # Source ROI profit skip check (owner rule 2026-10-13: >= +2% skip WITH auto re-entry watch)
     s_roi = source_margin_roi(p)
-    if s_roi >= PROFIT_SKIP_ROI:
-        return (f"SKIP {key} new_entry: already +{s_roi * 100:.1f}% source ROI "
-                f"(>= +3%) - too late to mirror"), None
+    if s_roi is not None and s_roi >= PROFIT_SKIP_ROI:
+        state.setdefault("skip_watch", {})[key] = {
+            "roi": s_roi, "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        return (f"SKIP-WATCH {key} new_entry: source ROI +{s_roi * 100:.1f}% >= +2%; "
+                f"watching for ROI drop below 2% (auto re-entry)"), None
 
     try:
         # Instrument status check (must be Trading, e.g. skip FETClosed)
@@ -826,10 +830,24 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
             return (f"CLOSED {key} source_close: profitable owner exit net positive after fees "
                     f"(+{net_return * 100:.2f}%) -> market closed")
 
-        # Retain losing position: cancel bot-copied source SL (preserve TP), configure BE floor trailing
-        client.set_sl_tp(symbol, stop_loss=0, take_profit=rec.get("price_target"), position_idx=idx)
-
+        # Retain losing position: cancel bot-copied source SL, configure BE floor trailing.
+        # Owner rule 2026-10-13: IMMEDIATELY place the exchange-side TP trigger order on the
+        # chart at the stop-trigger-rule level (fee-BE +/- activation offset) so the position
+        # exits at breakeven+ even if the VPS/poller dies. The local trailing manager cancels
+        # this TP once trailing activates, then ratchets the hard SL as before.
         act_thresh = fee_be * (1.0 + ACTIVATION_OFFSET) if side == "long" else fee_be * (1.0 - ACTIVATION_OFFSET)
+        tp_trigger = act_thresh
+        src_tp = float(rec.get("price_target") or 0)
+        if src_tp > 0:
+            tp_trigger = max(src_tp, act_thresh) if side == "long" else min(src_tp, act_thresh)
+        try:
+            inst = client.get_instrument(symbol)
+            grid = Decimal(str(inst.get("priceFilter", {}).get("tickSize", "0.01")))
+            rounding = ROUND_FLOOR if side == "long" else ROUND_CEILING
+            tp_trigger = float((Decimal(str(tp_trigger)) / grid).to_integral_value(rounding=rounding) * grid)
+        except BybitError:
+            pass
+        client.set_sl_tp(symbol, stop_loss=0, take_profit=tp_trigger, position_idx=idx)
 
         ret_info = {
             "key": key,
@@ -842,6 +860,7 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
             "status": "pending",
             "best_price": cp,
             "current_sl": None,
+            "tp_trigger": tp_trigger,
             "price_target": rec.get("price_target"),
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")
         }
@@ -850,7 +869,8 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
         save_state(state)
 
         return (f"TRAIL RETAINED {key} source_close: losing exit (net {net_return * 100:+.2f}%) "
-                f"-> fee-aware BE floor trailing pending (act={act_thresh:.4f}, BE={fee_be:.4f})")
+                f"-> BE floor trailing pending + exchange TP trigger placed at {tp_trigger} "
+                f"(act={act_thresh:.4f}, BE={fee_be:.4f})")
 
     except BybitError as e:
         return f"ERROR {key} source_close: {e}"
@@ -910,6 +930,8 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
                     ret["activation_threshold"] = (new_be*(1.0+ACTIVATION_OFFSET) if side == "long"
                                                    else new_be*(1.0-ACTIVATION_OFFSET))
                     if ret.get("status") != "active":
+                        ret["tp_trigger"] = None  # re-place TP trigger at the new threshold on next pass
+                    if ret.get("status") != "active":
                         ret["best_price"] = None
                     logs.append(f"TRAIL RESIZED {key}: owner added {actual-expected:g} (bot had {expected:g}, live now {actual:g}); BE floor {old_be:g} -> {new_be:g}, trailing continues on total")
                     continue
@@ -937,9 +959,37 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
                 if activated:
                     ret["status"] = "active"
                     ret["best_price"] = cp
+                    # Owner rule 2026-10-13: trailing is now live - cancel the exchange TP
+                    # trigger so the ratcheting hard SL can capture further upside.
+                    if ret.get("tp_trigger"):
+                        try:
+                            client.set_sl_tp(symbol, stop_loss=0, take_profit=0, position_idx=position_idx(symbol, side))
+                            logs.append(f"LOG {key}: cancelled exchange TP trigger {ret['tp_trigger']} - trailing stop now active")
+                            ret["tp_trigger"] = None
+                        except BybitError as e:
+                            logs.append(f"ERROR {key} cancel tp_trigger: {e}")
                     logs.append(f"TRAIL ACTIVATED BE FLOOR {key}: price {cp} reached activation threshold {ret['activation_threshold']}")
                 else:
-                    # Keep pending below threshold, do not place invalid SL
+                    # Keep pending below threshold, do not place invalid SL.
+                    # Owner rule 2026-10-13 (self-heal): ensure the exchange-side TP trigger
+                    # order exists while pending - covers positions retained before this rule.
+                    if ret.get("tp_trigger") is None and client.configured:
+                        tp = ret["activation_threshold"]
+                        src_tp = float(ret.get("price_target") or 0)
+                        if src_tp > 0:
+                            tp = max(src_tp, tp) if side == "long" else min(src_tp, tp)
+                        try:
+                            inst = client.get_instrument(symbol)
+                            grid = Decimal(str(inst.get("priceFilter", {}).get("tickSize", "0.01")))
+                            rounding = ROUND_FLOOR if side == "long" else ROUND_CEILING
+                            tp = float((Decimal(str(tp)) / grid).to_integral_value(rounding=rounding) * grid)
+                            client.set_sl_tp(symbol, stop_loss=0, take_profit=tp, position_idx=position_idx(symbol, side))
+                            ret["tp_trigger"] = tp
+                            ret["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            logs.append(f"TRAIL TP-TRIGGER {key}: placed exchange TP trigger at {tp} "
+                                        f"(BE floor {ret['fee_be']:.4f}); exits at breakeven+ even if poller dies")
+                        except BybitError as e:
+                            logs.append(f"ERROR {key} place tp_trigger: {e}")
                     continue
 
             if ret.get("status") == "active":
@@ -976,7 +1026,8 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
 
                 if should_update:
                     idx = position_idx(symbol, side)
-                    client.set_sl_tp(symbol, stop_loss=rounded_sl, take_profit=ret.get("price_target"), position_idx=idx)
+                    client.set_sl_tp(symbol, stop_loss=rounded_sl,
+                                     take_profit=ret.get("tp_trigger") or ret.get("price_target"), position_idx=idx)
                     ret["current_sl"] = rounded_sl
                     ret["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     logs.append(f"LOG RATCHET SL {key}: updated hard SL to {rounded_sl} (best={ret['best_price']}, floor={ret['fee_be']})")
@@ -1081,6 +1132,32 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                 deltas.append({"trader":trader_norm,"type":"new_entry","position":p,"retry_current":True})
                 existing_delta_keys.add(k)
 
+        # Owner rule 2026-10-13 (source-lost): a mirrored trade whose source position is
+        # gone from the CURRENT fresh books (lost / closed / no longer available) for 2
+        # consecutive polls is treated as a source close: profitable -> market close,
+        # losing -> retained with the stop-trigger rule and an exchange TP trigger order.
+        missing_ctr = state.setdefault("source_missing", {})
+        current_keys = {tkey(trader, p) for trader, book in payload.books.items()
+                        for p in book.get("positions", [])}
+        payload_traders = {normalize_trader(t) for t in payload.books}
+        for k in list(state.get("mirrored", {}).keys()):
+            if k in current_keys or k in state.get("retained_trailing", {}):
+                missing_ctr.pop(k, None)
+                continue
+            trader_k = k.split("|")[0]
+            if trader_k not in payload_traders:
+                missing_ctr.pop(k, None)  # no fresh snapshot for this trader; don't infer loss
+                continue
+            missing_ctr[k] = int(missing_ctr.get(k, 0)) + 1
+            if missing_ctr[k] >= 2:
+                del missing_ctr[k]
+                parts = k.split("|")
+                coin_side = parts[1].split("/")
+                deltas.append({"trader": parts[0], "type": "source_close", "source_lost": True,
+                               "position": {"ticker": coin_side[0], "side": coin_side[1],
+                                            "source_id": parts[2]}})
+                log_action(f"SOURCE-LOST {k}: source position absent from 2 consecutive polls; "
+                           f"treating as source close (stop-trigger rule applies)")
 
         client = BybitClient()
         open_mirrors: Dict[str, Dict[str, Any]] = {}
@@ -1182,6 +1259,7 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     action, new_rec = open_mirror(client, d["trader"], p, book_info, state)
                     if new_rec:
                         executed += 1
+                        state.get("skip_watch", {}).pop(k, None)
                         state.setdefault("entry_blocks", {}).pop(k, None)
                         log_action(action)
                     elif action.startswith("ERROR"):
@@ -1263,6 +1341,49 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                             log_action(f"SYNC {k} leverage={new_lev}")
                         except BybitError as e:
                             errors+=1;log_action(f"ERROR {k} leverage update: {e}")
+
+        # Owner rule 2026-10-13: re-evaluate skip-watch each poll - auto re-entry when a
+        # watched source trade's ROI drops below 2%.
+        for k, w in list(state.get("skip_watch", {}).items()):
+            parts = k.split("|")
+            if len(parts) != 3:
+                state["skip_watch"].pop(k, None)
+                continue
+            trader_k, sid = parts[0], parts[2]
+            src = None
+            book_info = {}
+            for trader, book in payload.books.items():
+                if normalize_trader(trader) != trader_k:
+                    continue
+                book_info = book
+                for p in book.get("positions", []):
+                    if (p.get("source_id") or tkey(trader, p)) == sid:
+                        src = p
+                        break
+            if src is None:
+                state["skip_watch"].pop(k, None)
+                log_action(f"SKIP-WATCH-ENDED {k}: source closed while still above skip threshold; never mirrored")
+                continue
+            roi = source_margin_roi(src)
+            if roi is None:
+                continue
+            w["roi"] = roi
+            if roi < PROFIT_SKIP_ROI:
+                if state.get("hold_new", True) or not state.get("cutover_armed", False):
+                    continue
+                if k in state.get("mirrored", {}) or k in state.get("parked_ambiguous", {}):
+                    state["skip_watch"].pop(k, None)
+                    continue
+                if DRY_RUN or not client.configured:
+                    log_action(f"DRY_RUN :: WOULD RE-ENTER {k} (ROI {roi*100:+.1f}%)")
+                    continue
+                action, new_rec = open_mirror(client, trader_k, src, book_info, state)
+                log_action(f"RE-ENTRY-CHECK {k}: source ROI now {roi*100:+.2f}% -> {action}")
+                if new_rec:
+                    state["skip_watch"].pop(k, None)
+                    executed += 1
+                elif action.startswith("ERROR"):
+                    errors += 1
 
         state["books"] = effective_books
         for _line in sanitize_stale_state(state):
