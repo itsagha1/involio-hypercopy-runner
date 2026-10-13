@@ -80,9 +80,10 @@ def normalize_source(meta, raw_positions, sims, profile=PROFILE):
             'snapshot_at':datetime.now(timezone.utc).isoformat(),
             'source_total_fees':sims.get('portfolioTotalFeeSim')}
 
-def fetch_source_book(profile=PROFILE):
-    if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
-    portfolio_id=PROFILES[profile]
+def fetch_source_book(profile=PROFILE, portfolio_id=None):
+    if portfolio_id is None:
+        if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+        portfolio_id=PROFILES[profile]
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
     session=requests.Session()

@@ -183,38 +183,38 @@ copy_listener.BybitClient = lambda: fake_client
 st = fresh_state()
 
 book_v1 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.0)], 'source_equity': 5000, 'remaining_sim': 4800}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v1)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v1)
 copy_listener.poll_once()
 ok(st['baseline'] == ['b1'] and st['armed'] is True, 'poll 1: existing positions baselined, instance armed')
 ok(len(fake_client.orders) == 0, 'poll 1: no orders on baseline run')
 
 book_v2 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01), cpos('SOL', 'long', 's1', roi=0.01)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v2)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v2)
 copy_listener.poll_once()
 ok(len(fake_client.orders) == 1 and 's1' in list(st['mirrored'])[0], 'poll 2: new source trade mirrored at market')
 
 book_v3 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01), cpos('SOL', 'long', 's1', roi=0.03)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v3)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v3)
 copy_listener.poll_once()
 ok(len(fake_client.orders) == 1, 'poll 3: pure source ROI change (PnL-only) generates no order')
 
 book_v4 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01),
                          cpos('SOL', 'long', 's1', roi=0.03),
                          cpos('DOGE', 'long', 'd9', roi=0.04)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v4)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v4)
 copy_listener.poll_once()
 ok(len(fake_client.orders) == 1 and 'DOGE' in list(st['skip_watch'])[0], 'poll 4: +4% new trade skipped into watch')
 
 book_v5 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01),
                          cpos('SOL', 'long', 's1', roi=0.03),
                          cpos('DOGE', 'long', 'd9', roi=0.012)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v5)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v5)
 copy_listener.poll_once()
 ok(len(fake_client.orders) == 2 and any('d9' in k for k in st['mirrored']), 'poll 5: watched trade auto-enters when ROI < 2%')
 ok(len(st['skip_watch']) == 0, 'poll 5: watch list cleared after auto-entry')
 
 book_v6 = {'positions': [cpos('BTC', 'long', 'b1', roi=0.01)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy(book_v6)
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(book_v6)
 fake_client.live_positions = [{'symbol': 'SOLUSDT', 'size': str(list(st['mirrored'].values())[0]['qty']), 'side': 'Buy', 'avgPrice': '100', 'markPrice': '105', 'breakEvenPrice': '100.12'},
                                {'symbol': 'DOGEUSDT', 'size': str(list(st['mirrored'].values())[1]['qty']), 'side': 'Buy', 'avgPrice': '100', 'markPrice': '95', 'breakEvenPrice': '100.12'}]
 copy_listener.poll_once()
@@ -247,11 +247,11 @@ c2.ticker_prices = {'SOLUSDT': '100'}
 copy_listener.BybitClient = lambda: c2
 st['mirrored']['testprof|SOL/long|g1'] = {'symbol': 'SOLUSDT', 'side': 'long', 'qty': 1.0, 'gen': 0, 'source_id': 'g1'}
 st['books'] = {'positions': [cpos('SOL', 'long', 'g1', roi=0.01)]}
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy({'positions': []})
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy({'positions': []})
 copy_listener.poll_once()
 ok(st.get('source_missing', {}).get('g1') == 1, 'glitch poll 1: counter at 1/2, no action')
 ok(len(st['mirrored']) == 1, 'glitch poll 1: mirror untouched')
-copy_listener.source_api.fetch_source_book = lambda profile: copy.deepcopy({'positions': [cpos('SOL', 'long', 'g1', roi=0.01)]})
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy({'positions': [cpos('SOL', 'long', 'g1', roi=0.01)]})
 copy_listener.poll_once()
 ok(st.get('source_missing', {}).get('g1') is None, 'glitch poll 2: source reappeared -> counter reset')
 ok(len(st['mirrored']) == 1, 'glitch poll 2: mirror still active, no close/retain')
@@ -264,7 +264,7 @@ st['retained']['testprof|DOGE/long|d9'] = {'symbol': 'DOGEUSDT', 'side': 'long',
     'fee_be': 100.12, 'tp_trigger': 100.62, 'activation_threshold': 100.6206,
     'status': 'pending', 'best_price': 95.0, 'current_sl': None, 'source_tp': 0}
 st['books'] = {'positions': []}
-copy_listener.source_api.fetch_source_book = lambda profile: {'positions': []}
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: {'positions': []}
 
 # pending below threshold: no trailing action, TP trigger untouched
 c3.live_positions = [{'symbol': 'DOGEUSDT', 'size': '10', 'side': 'Buy', 'avgPrice': '100', 'markPrice': '99', 'breakEvenPrice': '100.12'}]
@@ -297,4 +297,32 @@ copy_listener.poll_once()
 d9 = st['retained']['testprof|DOGE/long|d9']
 ok(d9['current_sl'] == 102.49, 'pullback: SL stays ratcheted at 102.49 (never loosens)')
 
-print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule + trailing 2026-10-13)')
+# --- c1.0.5: multi-portfolio merge (owner 2026-10-13: luxora Treasury + Odyssey) ---
+saved_pids = copy_listener.PORTFOLIO_IDS
+copy_listener.PORTFOLIO_IDS = ['7680483d-0000-0000-0000-000000000001', '06f2c4c5-0000-0000-0000-000000000002']
+t_books = [
+    {'positions': [cpos('BLUR', 'long', 't1', roi=0.01)], 'source_equity': 100.0, 'remaining_sim': 90.0},
+    {'positions': [cpos('DOGE', 'long', 'o1', roi=0.005), cpos('2Z', 'short', 'o2', roi=0.01)], 'source_equity': 200.0, 'remaining_sim': 150.0},
+]
+copy_listener.source_api.fetch_source_book = lambda profile, pid=None: copy.deepcopy(t_books[copy_listener.PORTFOLIO_IDS.index(pid)])
+st = fresh_state()
+copy_listener._GLOBAL_STATE["state"] = st
+copy_listener.poll_once()
+ok(st['baseline'] == sorted(['t1', 'o1', 'o2']), 'multi-portfolio: all existing positions from BOTH portfolios baselined at first run')
+ok(len(st.get('books', {}).get('positions', [])) == 3, 'multi-portfolio: books merged (3 positions from 2 portfolios)')
+ok(all(p.get('portfolio') in ('7680483d', '06f2c4c5') for p in st['books']['positions']), 'multi-portfolio: positions tagged with portfolio short-id')
+
+# new trade from the SECOND portfolio mirrors normally; losing it triggers source-lost rule
+c3b = FakeClient(wallet=1000, avail=1000)
+copy_listener.BybitClient = lambda: c3b
+t_books[1]['positions'].append(cpos('WLD', 'long', 'w9', roi=0.01, pct=2.0))
+copy_listener.poll_once()
+ok(any('w9' in k for k in st['mirrored']), 'multi-portfolio: new trade from 2nd portfolio (Odyssey) mirrored at market')
+t_books[1]['positions'] = [p for p in t_books[1]['positions'] if p.get('source_id') != 'w9']
+c3b.live_positions = [{'symbol': 'WLDUSDT', 'size': str(list(st['mirrored'].values())[0]['qty']), 'side': 'Buy', 'avgPrice': '100', 'markPrice': '99', 'breakEvenPrice': '100.12'}]
+copy_listener.poll_once()  # 1/2
+copy_listener.poll_once()  # 2/2 -> source-lost
+ok(any('WLD' in k for k in st.get('retained', {})), 'multi-portfolio: source-lost rule works for 2nd-portfolio mirrors (retained)')
+copy_listener.PORTFOLIO_IDS = saved_pids
+
+print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule + trailing + multi-portfolio 2026-10-13)')

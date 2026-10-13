@@ -51,9 +51,10 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.4"
+APP_VERSION = "c1.0.5"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
+PORTFOLIO_IDS = [p.strip() for p in PORTFOLIO_ID.split(",") if p.strip()]
 PORT = int(os.environ.get("COPY_PORT", "8001"))
 NAME = os.environ.get("COPY_NAME", PROFILE or "copy")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))
@@ -74,7 +75,7 @@ LOG_TAIL_LINES = 400
 
 # Bind the configured profile into the shared source adapter (validated on every fetch).
 if PROFILE and PORTFOLIO_ID:
-    source_api.PROFILES[PROFILE] = PORTFOLIO_ID
+    source_api.PROFILES[PROFILE] = PORTFOLIO_IDS[0]
 
 
 def log_action(line: str) -> None:
@@ -431,6 +432,26 @@ def state_get() -> Dict[str, Any]:
     return _GLOBAL_STATE["state"]
 
 
+def fetch_merged_books(profile: str) -> Dict[str, Any]:
+    """Fetch and merge the books of every portfolio bound to this subaccount.
+    COPY_PORTFOLIO_ID may be a comma-separated list (owner 2026-10-13: luxora
+    Treasury + Odyssey on one subaccount). Source investment ids are UUIDs and
+    never collide across portfolios; each position is tagged with its portfolio
+    short-id for status/log clarity."""
+    positions: List[Dict[str, Any]] = []
+    equity = 0.0
+    remaining = 0.0
+    for pid in PORTFOLIO_IDS:
+        book = source_api.fetch_source_book(profile, pid)
+        for p in book.get("positions", []):
+            p["portfolio"] = pid[:8]
+            positions.append(p)
+        equity += float(book.get("source_equity") or 0)
+        remaining += float(book.get("remaining_sim") or 0)
+    return {"positions": positions, "source_equity": equity,
+            "remaining_sim": remaining}
+
+
 # ---------------------------------------------------------------- poll cycle
 
 def poll_once() -> None:
@@ -438,7 +459,7 @@ def poll_once() -> None:
     client = BybitClient()
     errors = 0
     try:
-        book = source_api.fetch_source_book(PROFILE)
+        book = fetch_merged_books(PROFILE)
     except Exception as e:
         state["errors_last_run"] = state.get("errors_last_run", 0) + 1
         log_action(f"ERROR source fetch: {type(e).__name__}: {e}; retry next poll")
