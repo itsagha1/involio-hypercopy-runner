@@ -174,6 +174,16 @@ p_dead = cpos('FETCLOSED', 'long', 'f1', roi=0.0)
 a13, _ = copy_listener.open_mirror(c, p_dead, st)
 ok(a13.startswith('SKIP') and 'delisted' in a13, 'delisted symbol SKIP, not ERROR')
 
+# normalize_source must validate against the EXPLICIT portfolio id (multi-portfolio fetch)
+meta2 = {'success': True, 'portfolio': {'id': '06f2c4c5-0000-0000-0000-000000000002', 'owner': {'username': 'testprof'}, 'openPositions': 0}}
+book2 = copy_listener.source_api.normalize_source(meta2, [], {'success': True, 'investments': [], 'portfolioRemainingSim': 100.0}, 'testprof', portfolio_id='06f2c4c5-0000-0000-0000-000000000002')
+ok(book2.get('positions') == [], 'normalize_source: explicit portfolio id bypasses single-profile PROFILES map')
+try:
+    copy_listener.source_api.normalize_source(meta2, [], {'success': True, 'investments': [], 'portfolioRemainingSim': 100.0}, 'testprof')
+    ok(False, 'should have raised without explicit id')
+except copy_listener.source_api.SourceDataError as e:
+    ok('Wrong or incomplete' in str(e), 'without explicit id the 2nd portfolio is rejected (guards single-portfolio setups)')
+
 print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (c1.0.0)')
 
 # --- 12. full poll-cycle integration: baseline -> open -> watch -> auto re-entry -> loss close ---
@@ -324,5 +334,15 @@ copy_listener.poll_once()  # 1/2
 copy_listener.poll_once()  # 2/2 -> source-lost
 ok(any('WLD' in k for k in st.get('retained', {})), 'multi-portfolio: source-lost rule works for 2nd-portfolio mirrors (retained)')
 copy_listener.PORTFOLIO_IDS = saved_pids
+
+# normalize_source must validate against the EXPLICIT portfolio id (multi-portfolio fetch)
+meta2 = {'success': True, 'portfolio': {'id': '06f2c4c5-0000-0000-0000-000000000002', 'owner': {'username': 'testprof'}, 'openPositions': 0}}
+book2 = copy_listener.source_api.normalize_source(meta2, [], {'success': True, 'investments': [], 'portfolioRemainingSim': 100.0}, 'testprof', portfolio_id='06f2c4c5-0000-0000-0000-000000000002')
+ok(book2.get('positions') == [], 'normalize_source: explicit portfolio id bypasses single-profile PROFILES map')
+try:
+    copy_listener.source_api.normalize_source(meta2, [], {'success': True, 'investments': [], 'portfolioRemainingSim': 100.0}, 'testprof')
+    ok(False, 'should have raised without explicit id')
+except copy_listener.source_api.SourceDataError as e:
+    ok('Wrong or incomplete' in str(e), 'without explicit id the 2nd portfolio is rejected (guards single-portfolio setups)')
 
 print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule + trailing + multi-portfolio 2026-10-13)')

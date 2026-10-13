@@ -16,9 +16,9 @@ def positive(value, name):
         raise SourceDataError('Nonpositive '+name)
     return value
 
-def normalize_source(meta, raw_positions, sims, profile=PROFILE):
+def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None):
     if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
-    portfolio_id=PROFILES[profile]
+    portfolio_id = portfolio_id or PROFILES[profile]
     portfolio = meta.get('portfolio') or {}
     if meta.get('success') is not True or portfolio.get('id') != portfolio_id:
         raise SourceDataError('Wrong or incomplete source portfolio')
@@ -109,4 +109,4 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
         positions.extend(batch)
         if len(batch)<50: break
     sims=post('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
-    return normalize_source(metadata,positions,sims,profile)
+    return normalize_source(metadata,positions,sims,profile,portfolio_id)
