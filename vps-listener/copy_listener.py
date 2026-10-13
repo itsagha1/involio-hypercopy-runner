@@ -6,7 +6,10 @@ Owner spec 2026-10-12 (separate from the protected-mirror main listener):
 - Source-lost rule (owner 2026-10-13): a mirrored trade whose source disappears from
   the books for 2 consecutive polls (closed, lost, or unavailable) is treated as a
   source close: profitable -> closed at market; losing -> retained with an exchange-side
-  TP trigger at fee-adjusted breakeven +/- 0.5% (exits at breakeven+ even if the bot dies).
+  TP trigger at fee-adjusted breakeven +/- 0.5% (exits at breakeven+ even if the bot dies),
+  then trailing management exactly like the main listener: once price reaches the activation
+  threshold the TP trigger is cancelled and a hard SL is ratcheted on the exchange, 0.5%
+  behind the best price, never worse than the fee-adjusted breakeven floor (owner 2026-10-13).
 - New entries already at >= 2% source-margin ROI are skipped as "watch" candidates;
   each poll re-checks watched trades and opens at market once ROI < 2% again.
 - Existing positions at first run are baselined (never mirrored).
@@ -48,7 +51,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.3"
+APP_VERSION = "c1.0.4"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
 PORT = int(os.environ.get("COPY_PORT", "8001"))
@@ -62,6 +65,7 @@ STATE_LOCK = __import__("threading").Lock()
 PROFIT_SKIP_ROI = 0.02          # 2% profit-skip threshold (owner 2026-10-12)
 FEE_ALLOWANCE = 0.0012      # 0.12% roundtrip fee allowance for source-lost breakeven math
 TP_TRIGGER_OFFSET = 0.005  # +0.5% beyond fee-adjusted breakeven for the retained TP trigger
+TRAILING_DIST_PCT = 0.005  # 0.5% price trailing distance (same rule as the main listener)
 MAX_LEVERAGE = 50
 MIN_NOTIONAL = 5.0
 MARGIN_CAP = 0.70               # guard: total margin cap of wallet (like main listener)
@@ -405,9 +409,12 @@ def handle_source_lost(client: BybitClient, rec_key: str, state: Dict[str, Any])
         if src_tp > 0:
             tp = max(src_tp, tp) if side == "long" else min(src_tp, tp)
         client.set_sl_tp(symbol, stop_loss=0, take_profit=tp, position_idx=position_idx(symbol, side))
+        act_thresh = fee_be * (1.0 + TP_TRIGGER_OFFSET) if side == "long" else fee_be * (1.0 - TP_TRIGGER_OFFSET)
         state.setdefault("retained", {})[key] = {
             "symbol": symbol, "side": side, "qty": qty, "entry": avg,
-            "fee_be": fee_be, "tp_trigger": tp,
+            "fee_be": fee_be, "tp_trigger": tp, "activation_threshold": act_thresh,
+            "status": "pending", "best_price": mark, "current_sl": None,
+            "source_tp": src_tp,
             "retained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "source_id": rec.get("source_id")}
         return (f"SOURCE-LOST-RETAINED {key}: source gone 2 polls, net {net_return * 100:+.2f}% "
@@ -579,22 +586,96 @@ def poll_once() -> None:
     for k in [k for k in state.setdefault("entry_blocks", {}) if k.split("|")[-1] not in held_ids and k not in state["mirrored"]]:
         del state["entry_blocks"][k]
 
-    # --- retained cleanup: drop retained bookkeeping once the exchange position is gone ---
+    # --- retained trailing (owner 2026-10-13): same protection as the main listener ---
+    # Pending: exchange TP trigger at BE+/-0.5% guarantees a breakeven+ exit even if the
+    # bot dies. Once price reaches the activation threshold the TP is cancelled and the
+    # hard SL is ratcheted on the exchange, 0.5% behind the best price, never worse
+    # than the fee-adjusted breakeven floor.
     retained = state.get("retained", {})
     if retained and client.configured and not DRY_RUN:
-        live_pairs = set()
-        try:
-            for lp in client.get_positions():
-                if float(lp.get("size") or 0) > 0:
-                    live_pairs.add((lp.get("symbol"), "long" if lp.get("side") == "Buy" else "short"))
-        except BybitError as e:
-            errors += 1
-            log_action(f"ERROR retained cleanup: {e}")
-        for k, r in list(retained.items()):
-            if (r.get("symbol"), r.get("side")) not in live_pairs:
-                del retained[k]
-                log_action(f"RETAINED-EXITED {k}: exchange position gone "
-                           f"(TP trigger {r.get('tp_trigger')} filled or closed manually); deregistered")
+        for key, r in list(retained.items()):
+            symbol, side = r.get("symbol"), r.get("side")
+            try:
+                live = [lp for lp in client.get_positions(symbol)
+                        if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                        and float(lp.get("size") or 0) > 0]
+                lp = live[0] if live else None
+                if lp is None:
+                    del retained[key]
+                    log_action(f"RETAINED-EXITED {key}: exchange position gone "
+                               f"(stop/TP filled or closed manually); deregistered")
+                    continue
+                cp = float(lp.get("markPrice") or 0)
+                fee_be = float(r.get("fee_be") or 0)
+                if cp <= 0 or fee_be <= 0:
+                    continue
+                inst = client.get_instrument(symbol)
+                grid = Decimal(str(inst.get("priceFilter", {}).get("tickSize") or "0.01"))
+                if r.get("status") != "active":
+                    act = float(r.get("activation_threshold") or 0)
+                    if act <= 0:
+                        act = fee_be * ((1.0 + TP_TRIGGER_OFFSET) if side == "long" else (1.0 - TP_TRIGGER_OFFSET))
+                        r["activation_threshold"] = act
+                    if (cp >= act) if side == "long" else (cp <= act):
+                        r["status"] = "active"
+                        r["best_price"] = cp
+                        if r.get("tp_trigger"):
+                            try:
+                                client.set_sl_tp(symbol, stop_loss=0, take_profit=0,
+                                                 position_idx=position_idx(symbol, side))
+                                log_action(f"TRAIL ACTIVATED {key}: price {cp} reached {act:.6f}; "
+                                           f"cancelled TP trigger {r['tp_trigger']}; hard SL ratcheting begins")
+                                r["tp_trigger"] = None
+                            except BybitError as e:
+                                errors += 1
+                                log_action(f"ERROR {key} cancel tp_trigger: {e}")
+                    else:
+                        # self-heal: keep the exchange TP trigger in place while pending
+                        if r.get("tp_trigger") is None:
+                            tp = act
+                            src_tp = float(r.get("source_tp") or 0)
+                            if src_tp > 0:
+                                tp = max(src_tp, tp) if side == "long" else min(src_tp, tp)
+                            rounding = ROUND_FLOOR if side == "long" else ROUND_CEILING
+                            tp = float((Decimal(str(tp)) / grid).to_integral_value(rounding=rounding) * grid)
+                            client.set_sl_tp(symbol, stop_loss=0, take_profit=tp,
+                                             position_idx=position_idx(symbol, side))
+                            r["tp_trigger"] = tp
+                            log_action(f"TRAIL TP-TRIGGER {key}: re-placed exchange TP trigger at {tp} "
+                                       f"(BE floor {fee_be:.6f}); exits at breakeven+ even if bot dies")
+                    if r.get("status") != "active":
+                        continue
+                if r.get("status") == "active":
+                    if side == "long":
+                        r["best_price"] = max(float(r.get("best_price") or cp), cp)
+                        intended = max(fee_be, r["best_price"] * (1.0 - TRAILING_DIST_PCT))
+                        rounding = ROUND_CEILING
+                    else:
+                        r["best_price"] = min(float(r.get("best_price") or cp), cp)
+                        intended = min(fee_be, r["best_price"] * (1.0 + TRAILING_DIST_PCT))
+                        rounding = ROUND_FLOOR
+                    rounded_sl = float((Decimal(str(intended)) / grid).to_integral_value(rounding=rounding) * grid)
+                    if (side == "long" and rounded_sl >= cp) or (side == "short" and rounded_sl <= cp):
+                        if r.get("current_sl"):
+                            log_action(f"LOG {key}: protective floor crossed before exchange update; "
+                                       f"existing stop {r['current_sl']} still protects")
+                        else:
+                            errors += 1
+                            log_action(f"ERROR {key}: intended protective floor crossed before exchange update "
+                                       f"and no existing stop")
+                        continue
+                    prev_sl = r.get("current_sl")
+                    should_update = (prev_sl is None or (side == "long" and rounded_sl > prev_sl)
+                                      or (side == "short" and rounded_sl < prev_sl))
+                    if should_update:
+                        client.set_sl_tp(symbol, stop_loss=rounded_sl, take_profit=0,
+                                         position_idx=position_idx(symbol, side))
+                        r["current_sl"] = rounded_sl
+                        log_action(f"TRAIL RATCHET {key}: hard SL -> {rounded_sl} "
+                                   f"(best={r['best_price']}, floor={fee_be:.6f})")
+            except BybitError as e:
+                errors += 1
+                log_action(f"ERROR {key} retained trailing: {e}")
 
     state["books"] = book
     state["last_poll"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

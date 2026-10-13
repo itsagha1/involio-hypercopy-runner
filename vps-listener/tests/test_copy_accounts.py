@@ -27,7 +27,8 @@ def ok(cond, label):
 
 def fresh_state():
     st = {"baseline": [], "mirrored": {}, "skip_watch": {}, "manual": [], "entry_blocks": {},
-          "books": None, "last_poll": None, "errors_last_run": 0, "armed": False}
+          "books": None, "last_poll": None, "errors_last_run": 0, "armed": False,
+          "retained": {}, "source_missing": {}}
     copy_listener._GLOBAL_STATE["state"] = st
     return st
 
@@ -255,4 +256,45 @@ copy_listener.poll_once()
 ok(st.get('source_missing', {}).get('g1') is None, 'glitch poll 2: source reappeared -> counter reset')
 ok(len(st['mirrored']) == 1, 'glitch poll 2: mirror still active, no close/retain')
 
-print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule 2026-10-13)')
+# --- c1.0.4: retained trailing management (owner 2026-10-13: trailing SL + TP trigger) ---
+st = fresh_state()
+c3 = FakeClient(wallet=1000, avail=1000)
+copy_listener.BybitClient = lambda: c3
+st['retained']['testprof|DOGE/long|d9'] = {'symbol': 'DOGEUSDT', 'side': 'long', 'qty': 10.0,
+    'fee_be': 100.12, 'tp_trigger': 100.62, 'activation_threshold': 100.6206,
+    'status': 'pending', 'best_price': 95.0, 'current_sl': None, 'source_tp': 0}
+st['books'] = {'positions': []}
+copy_listener.source_api.fetch_source_book = lambda profile: {'positions': []}
+
+# pending below threshold: no trailing action, TP trigger untouched
+c3.live_positions = [{'symbol': 'DOGEUSDT', 'size': '10', 'side': 'Buy', 'avgPrice': '100', 'markPrice': '99', 'breakEvenPrice': '100.12'}]
+copy_listener.poll_once()
+d9 = st['retained']['testprof|DOGE/long|d9']
+ok(d9['status'] == 'pending' and d9['tp_trigger'] == 100.62, 'pending below threshold: no activation, TP trigger kept')
+ok(len(c3.stops) == 0, 'pending: no SL/TP changes pushed')
+
+# price reaches activation (100.62): TP cancelled, trailing SL placed at BE floor
+c3.live_positions = [{'symbol': 'DOGEUSDT', 'size': '10', 'side': 'Buy', 'avgPrice': '100', 'markPrice': '101', 'breakEvenPrice': '100.12'}]
+copy_listener.poll_once()
+d9 = st['retained']['testprof|DOGE/long|d9']
+ok(d9['status'] == 'active', 'activation: trailing active once price reaches BE+0.5% threshold')
+ok(d9['tp_trigger'] is None, 'activation: exchange TP trigger cancelled (trailing takes over)')
+ok(c3.stops[0] == ('sltp', 'DOGEUSDT', '0', '0'), 'activation: TP cancel call placed (sl=0, tp=0)')
+import math
+ok(d9['current_sl'] == 100.50, f"activation: hard SL at best 101 * 0.995 = 100.50 (got {d9['current_sl']})")
+ok(c3.stops[1][0] == 'sltp' and c3.stops[1][2] == '100.5', 'activation: SL ratchet call sent to exchange (100.5)')
+
+# price rises to 103: SL ratchets up behind best, never below BE floor
+c3.live_positions = [{'symbol': 'DOGEUSDT', 'size': '10', 'side': 'Buy', 'avgPrice': '100', 'markPrice': '103', 'breakEvenPrice': '100.12'}]
+copy_listener.poll_once()
+d9 = st['retained']['testprof|DOGE/long|d9']
+ok(d9['current_sl'] == 102.49, f"ratchet: SL moves to 103 * 0.995 = 102.49 (got {d9['current_sl']})")
+ok(d9['best_price'] == 103.0, 'ratchet: best price tracks high')
+
+# price pulls back to 100.8: SL never ratchets DOWN, BE floor protected
+c3.live_positions = [{'symbol': 'DOGEUSDT', 'size': '10', 'side': 'Buy', 'avgPrice': '100', 'markPrice': '100.8', 'breakEvenPrice': '100.12'}]
+copy_listener.poll_once()
+d9 = st['retained']['testprof|DOGE/long|d9']
+ok(d9['current_sl'] == 102.49, 'pullback: SL stays ratcheted at 102.49 (never loosens)')
+
+print('ALL ' + str(PASS) + ' COPY-ACCOUNT CHECKS PASSED (poll-cycle integration + source-lost rule + trailing 2026-10-13)')
