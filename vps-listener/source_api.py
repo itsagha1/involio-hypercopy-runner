@@ -17,12 +17,20 @@ def positive(value, name):
     return value
 
 def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None):
-    if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+    # owner 2026-10-16: profile may be comma-separated (multi-owner subaccount,
+    # e.g. bluespire,b4451). Every name must be registered; the portfolio's
+    # owner username must be one of them.
+    allowed = {x.strip() for x in str(profile).split(",") if x.strip()}
+    if not allowed:
+        raise SourceDataError("Unauthorized source profile")
+    for name in allowed:
+        if name not in PROFILES:
+            raise SourceDataError("Unauthorized source profile")
     portfolio_id = portfolio_id or PROFILES[profile]
     portfolio = meta.get('portfolio') or {}
     if meta.get('success') is not True or portfolio.get('id') != portfolio_id:
         raise SourceDataError('Wrong or incomplete source portfolio')
-    if (portfolio.get('owner') or {}).get('username') != profile:
+    if (portfolio.get('owner') or {}).get('username') not in allowed:
         raise SourceDataError('Wrong source owner')
     if sims.get('success') is not True or not isinstance(sims.get('investments'), list):
         raise SourceDataError('Incomplete source sim data')

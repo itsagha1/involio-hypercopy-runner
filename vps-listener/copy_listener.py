@@ -53,6 +53,7 @@ from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
 
 APP_VERSION = "c1.0.5"
 PROFILE = os.environ.get("COPY_PROFILE", "")
+PROFILE_NAMES = [x.strip() for x in PROFILE.split(",") if x.strip()]
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
 PORTFOLIO_IDS = [p.strip() for p in PORTFOLIO_ID.split(",") if p.strip()]
 PORT = int(os.environ.get("COPY_PORT", "8001"))
@@ -75,7 +76,11 @@ LOG_TAIL_LINES = 400
 
 # Bind the configured profile into the shared source adapter (validated on every fetch).
 if PROFILE and PORTFOLIO_ID:
-    source_api.PROFILES[PROFILE] = PORTFOLIO_IDS[0]
+    # multi-owner subaccounts (owner 2026-10-16: bluespire + b4451): bind every
+    # configured profile name to its portfolio; ownership is re-validated per
+    # fetch against the portfolio owner username in normalize_source.
+    for _name, _pid in zip(PROFILE_NAMES, PORTFOLIO_IDS):
+        source_api.PROFILES[_name] = _pid
 
 
 def log_action(line: str) -> None:
