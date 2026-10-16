@@ -1506,6 +1506,80 @@ def health():
             "books":{k:len(v.get("positions",[])) for k,v in state.get("books",{}).items()},"log_tail":log_tail(),
             "errors_last_run":state.get("errors_last_run",0),"risk_manager_alive":bool(RISK_TASK and not RISK_TASK.done()),"risk_interval_seconds":2}
 
+
+@app.get("/status/all")
+def status_all(x_signature: str = Header(default="")):
+    """Owner fleet overview (2026-10-16): combined live status of the main mirror
+    account (this listener) and every dedicated copy subaccount listener
+    (127.0.0.1:8001-8005). Protected by the same shared secret as the webhook so
+    it is safe to expose through the Cloudflare tunnel for the HyperCopy
+    dashboard. Never calls Bybit directly - serves cached snapshots."""
+    import urllib.request, urllib.error
+    secret = get_shared_secret()
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, secret):
+        raise HTTPException(403, "bad signature")
+    accounts = []
+    try:
+        main = health()
+    except Exception as e:
+        main = {"ok": False, "status": "error", "error": str(e)[:200]}
+    accounts.append({
+        "id": "main", "name": "Main (booobsas+akira+oozypath)", "port": 8000,
+        "version": main.get("code_version"), "ok": main.get("ok"),
+        "errors_last_run": main.get("errors_last_run", 0),
+        "wallet_balance": main.get("wallet_balance"),
+        "available_balance": main.get("available_balance"),
+        "mirrored": main.get("mirrored", {}), "retained": main.get("retained", []),
+        "manual": main.get("manual", []),
+        "skip_watch_count": len(main.get("skip_watch", {}) or {}) if isinstance(main.get("skip_watch"), dict) else 0,
+        "source_missing_count": len(main.get("source_missing", {}) or {}) if isinstance(main.get("source_missing"), dict) else 0,
+        "baseline_count": main.get("baseline_count", 0),
+        "books": main.get("books", {}),
+        "dry_run": main.get("dry_run"),
+        "hold_new": main.get("hold_new"),
+        "risk_manager_alive": main.get("risk_manager_alive"),
+    })
+    copies = [
+        (8001, "copy-mainport", "henderson_14"), (8002, "copy-bakery", "nathanbrown"),
+        (8003, "copy-scalping", "luxora"), (8004, "copy-kings", "xk1ngss"),
+        (8005, "copy-bluespire", "bluespire+b4451"),
+    ]
+    for port, name, profile in copies:
+        try:
+            req = urllib.request.Request("http://127.0.0.1:%d/status" % port,
+                                         headers={"X-Internal-Status": "1"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                d = json.loads(r.read().decode())
+            retained = d.get("retained", [])
+            if isinstance(retained, dict):
+                retained = list(retained.values())
+            mirrored = d.get("mirrored", {}) or {}
+            if not isinstance(mirrored, dict):
+                mirrored = {}
+            accounts.append({
+                "id": name, "name": "%s (%s)" % (name, profile), "port": port,
+                "version": d.get("code_version"), "ok": True,
+                "errors_last_run": d.get("errors_last_run", 0),
+                "wallet_balance": d.get("wallet"),
+                "available_balance": d.get("wallet_available", d.get("available_balance")),
+                "mirrored": mirrored, "retained": retained,
+                "manual": d.get("manual", []),
+                "skip_watch_count": len(d.get("skip_watch", {}) or {}) if isinstance(d.get("skip_watch"), dict) else 0,
+                "source_missing_count": len(d.get("source_missing", {}) or {}) if isinstance(d.get("source_missing"), dict) else 0,
+                "baseline_count": d.get("baseline_count", 0),
+                "books": d.get("books", {}),
+                "dry_run": d.get("dry_run"),
+                "hold_new": None,
+                "risk_manager_alive": True,
+            })
+        except Exception as e:
+            accounts.append({"id": name, "name": name, "port": port, "ok": False,
+                             "error": "%s: %s" % (type(e).__name__, str(e)[:150])})
+    return {"ok": all(a.get("ok") for a in accounts), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "accounts": accounts}
+
 @app.get("/log")
 def log_endpoint(n:int=400):
     return {"ok":True,"code_version":LISTENER_VERSION,"lines":log_tail(min(max(n,1),2000))}
