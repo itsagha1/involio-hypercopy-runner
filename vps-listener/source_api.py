@@ -118,3 +118,36 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
         if len(batch)<50: break
     sims=post('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
     return normalize_source(metadata,positions,sims,profile,portfolio_id)
+
+
+def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
+    """Map of recently-closed Involio positions keyed by their ORIGINAL open
+    investment id (owner 2026-10-18). Closed records carry the open id in baseId.
+    Used by copy_listener to distinguish a normal source close (must be followed
+    at market, 100% mirror) from a genuinely vanished position (retention case)."""
+    if portfolio_id is None:
+        if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+        portfolio_id=PROFILES[profile]
+    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    if not token: raise SourceDataError('Involio source credential missing on VPS')
+    session=requests.Session()
+    session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+    response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
+    response.raise_for_status()
+    access=response.json().get('accessToken')
+    if not access: raise SourceDataError('Involio refresh did not return access token')
+    session.headers['Authorization']='Bearer '+access
+    closed={}
+    for page in range(1,max(1,int(pages))+1):
+        response=session.post(BASE+'/v1_0/investments/get_investments',json={'portfolioId':portfolio_id,'isOpen':False,'params':{'page':page,'size':50}},timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('Source API failed for closed investments')
+        batch=value.get('investmentsTicker')
+        if not isinstance(batch,list): raise SourceDataError('Missing closed-position page')
+        for x in batch:
+            bid=x.get('baseId')
+            if bid:
+                closed[bid]={'ticker':x.get('ticker'),'closedAt':x.get('closedAt'),'reason':x.get('reasonClosed')}
+        if len(batch)<50: break
+    return closed

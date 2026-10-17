@@ -51,7 +51,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.5"
+APP_VERSION = "c1.0.6"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PROFILE_NAMES = [x.strip() for x in PROFILE.split(",") if x.strip()]
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
@@ -459,6 +459,45 @@ def fetch_merged_books(profile: str) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- poll cycle
 
+def fetch_closed_map() -> Dict[str, Dict[str, Any]]:
+    """Closed-book map across every portfolio bound to this subaccount
+    (owner 2026-10-18). Returns {original_open_investment_id:
+    {ticker, closedAt, reason}}. Involio closed records reference the original
+    open investment id in baseId."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for name, pid in zip(PROFILE_NAMES, PORTFOLIO_IDS):
+        merged.update(source_api.fetch_closed_base_ids(name, pid, pages=2))
+    return merged
+
+
+def close_confirmed_at_market(client: BybitClient, rec_key: str,
+                              rec: Dict[str, Any], info: Dict[str, Any]) -> str:
+    """Owner 2026-10-18: the source trade is CONFIRMED CLOSED on Involio (its id
+    appears in the closed book). 100% mirror: close our mirror at market regardless
+    of P/L, winning or losing. Retention is reserved for positions absent from BOTH
+    the open and closed books (genuinely lost)."""
+    key = rec_key
+    symbol, side = rec["symbol"], rec["side"]
+    try:
+        live = [lp for lp in client.get_positions(symbol)
+                if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                and float(lp.get("size") or 0) > 0]
+        if not live:
+            return (f"CLOSED {key} 100% follow: source confirmed closed on Involio "
+                    f"(reason={info.get('reason')}); position already flat; deregistered")
+        lp = live[0]
+        qty = round_qty(min(float(lp["size"]), float(rec["qty"]) or float(lp["size"])),
+                        client.get_instrument(symbol))
+        place_order_mode_safe(client, symbol, close_side(side), qty,
+                              position_idx=position_idx(symbol, side), reduce_only=True,
+                              order_link_id=order_link(key, "confclose", int(rec.get("gen", 0))))
+        return (f"CLOSED {key} 100% follow: source confirmed closed on Involio "
+                f"(reason={info.get('reason')}, closedAt={str(info.get('closedAt'))[:19]}) "
+                f"-> mirror closed at market (loss followed, no retention)")
+    except BybitError as e:
+        return f"ERROR {key} confirmed-close: {e} - will retry next poll"
+
+
 def poll_once() -> None:
     state = state_get()
     client = BybitClient()
@@ -527,22 +566,48 @@ def poll_once() -> None:
         for k in [k for k in blocks if k.split("|")[-1] == sid]:
             del blocks[k]
 
-    # --- source-lost rule (owner 2026-10-13): 2-poll confirmation over mirrors ---
-    # A mirrored trade whose source is absent from the CURRENT books increments a
-    # counter; 2 consecutive polls confirms the source close (protects against API
-    # glitches). Profitable -> close at market; losing -> retained with TP trigger.
+    # --- source-close confirmation + source-lost rule (owner 2026-10-18) ---
+    # When a mirrored trade vanishes from the open books, check Involio's CLOSED
+    # book (closed records carry the original open investment id in baseId):
+    #  - present there -> NORMAL source close: 100% mirror, close at market
+    #    regardless of P/L (winning or losing). No retention.
+    #  - absent from both books for 2 consecutive polls -> genuinely lost/hidden:
+    #    profitable -> close at market; losing -> retained with breakeven TP
+    #    trigger (the owner's only accepted retention case).
     missing = state.setdefault("source_missing", {})
     for sid in list(missing):
         if sid in by_id:
             missing.pop(sid, None)
     if not (DRY_RUN or not client.configured):
-        for rec_key in list(state["mirrored"].keys()):
+        absent = [rk for rk in list(state["mirrored"].keys())
+                  if rk.split("|")[-1] not in by_id]
+        closed_map = {}
+        closed_map_ok = True
+        if absent:
+            try:
+                closed_map = fetch_closed_map()
+            except Exception as e:
+                closed_map_ok = False
+                log_action(f"LOG closed-book fetch failed ({type(e).__name__}: "
+                           f"{str(e)[:100]}); waiting before close/retain decisions")
+        for rec_key in absent:
             sid = rec_key.split("|")[-1]
-            if sid in by_id:
+            info = closed_map.get(sid)
+            if info is not None:
+                missing.pop(sid, None)
+                action = close_confirmed_at_market(client, rec_key,
+                                                   state["mirrored"][rec_key], info)
+                log_action(action)
+                if action.startswith("ERROR"):
+                    errors += 1
+                else:
+                    state["mirrored"].pop(rec_key, None)
                 continue
+            if not closed_map_ok:
+                continue  # decide only when the closed book is reachable
             missing[sid] = int(missing.get(sid, 0)) + 1
             if missing[sid] < 2:
-                log_action(f"SOURCE-MISSING {rec_key}: source absent from books "
+                log_action(f"SOURCE-MISSING {rec_key}: source absent from open AND closed books "
                            f"(poll {missing[sid]}/2); awaiting confirmation")
                 continue
             action = handle_source_lost(client, rec_key, state)
