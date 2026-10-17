@@ -51,7 +51,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.6"
+APP_VERSION = "c1.0.7"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PROFILE_NAMES = [x.strip() for x in PROFILE.split(",") if x.strip()]
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
@@ -296,6 +296,16 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
             delta = round_qty(rec["qty"] * ratio - rec["qty"], inst)
             if delta <= 0:
                 return None
+            last_px = float(client.get_ticker(symbol)["lastPrice"] or 0)
+            if last_px > 0 and delta * last_px < 5.0:
+                # Owner 2026-10-18: Bybit minimum order value is 5 USDT. A
+                # sub-minimum size-add is ACCUMULATED, not an error: the desired
+                # source qty is kept and the full remaining gap is retried every
+                # poll until it clears the exchange minimum (bigger source adds
+                # or wallet growth). Never counts as an engine error.
+                rec["desired_source_qty"] = curr_sq
+                return (f"SKIP {key} size_add: +{delta} (~{delta * last_px:.2f} USDT) "
+                        f"below Bybit 5 USDT minimum - accumulated, retried next poll")
             avail = float(client.get_available_balance() or 0)
             lev = int(rec.get("leverage") or 1) or 1
             if delta * float(client.get_ticker(symbol)["lastPrice"]) / lev > avail * MAX_AVAIL_PER_TRADE:
