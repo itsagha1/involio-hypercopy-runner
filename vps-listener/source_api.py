@@ -230,3 +230,92 @@ def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
                 closed[bid]={'ticker':x.get('ticker'),'closedAt':x.get('closedAt'),'reason':x.get('reasonClosed')}
         if len(batch)<50: break
     return closed
+
+
+def fetch_source_stats(profile=PROFILE, portfolio_id=None):
+    """Owner 2026-10-19: per-source performance stats for the dashboard:
+    trades within the last 24h (closed in window + opened in window and still
+    open), open count, total trades, wins/losses and total P/L. paper/sim
+    portfolios use portfolio metadata (closedPositions, winRate, plSnapshot)
+    plus closed/open book scans for the 24h window; live (DEX) portfolios use
+    /dex/portfolio/live/<pid>/overview (allTimePnl, closedCount, accuracyPct,
+    pnl24h) plus the DEX open/closed lists."""
+    from datetime import timedelta
+    if portfolio_id is None:
+        if profile not in PROFILES: raise SourceDataError('Unauthorized source profile')
+        portfolio_id = PROFILES[profile]
+    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    if not token: raise SourceDataError('Involio source credential missing on VPS')
+    session=requests.Session()
+    session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+    response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
+    response.raise_for_status()
+    access=response.json().get('accessToken')
+    if not access: raise SourceDataError('Involio refresh did not return access token')
+    session.headers['Authorization']='Bearer '+access
+    def post(path,data):
+        response=session.post(BASE+path,json=data,timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('Source API failed for '+path)
+        return value
+    meta=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+    portfolio=meta.get('portfolio') or {}
+    if portfolio.get('id') != portfolio_id:
+        raise SourceDataError('Wrong or incomplete source portfolio')
+    now=datetime.now(timezone.utc)
+    def recent(iso):
+        if not iso: return False
+        try: t=datetime.fromisoformat(str(iso).replace('Z','+00:00'))
+        except (TypeError, ValueError): return False
+        if t.tzinfo is None: t=t.replace(tzinfo=timezone.utc)
+        return (now-t) <= timedelta(hours=24)
+    if portfolio.get('type')=='live':
+        def get(path,params=None):
+            response=session.get(BASE+path,params=params or {},timeout=25)
+            response.raise_for_status();value=response.json()
+            if value.get('success') is not True or value.get('error'):
+                raise SourceDataError('DEX API failed for '+path)
+            return value.get('data') or {}
+        overview=get('/dex/portfolio/live/'+str(portfolio_id)+'/overview')
+        cl=get('/dex/portfolio/position/'+str(portfolio_id)+'/list',{'isOpen':'false','limit':'100'})
+        op=get('/dex/portfolio/position/'+str(portfolio_id)+'/list',{'isOpen':'true','limit':'100'})
+        closed_recent=sum(1 for x in (cl.get('positions') or []) if recent(x.get('closedAt')))
+        opened_recent=sum(1 for x in (op.get('positions') or []) if recent(x.get('openedAt')))
+        closed_total=int(float(overview.get('closedCount') or 0))
+        acc=float(overview.get('accuracyPct') or 0)
+        wins=int(round(acc/100.0*closed_total)) if closed_total else 0
+        atp=overview.get('allTimePnl') or {}
+        p24=overview.get('pnl24h') or {}
+        open_now=int((overview.get('openTrades') or {}).get('count') or 0)
+        return {'profile':profile,'portfolio_title':portfolio.get('title'),'type':'live','unit':'cash',
+                'open_now':open_now,'trades_24h':closed_recent+opened_recent,
+                'closed_24h':closed_recent,'opened_24h':opened_recent,
+                'total_trades':closed_total+open_now,'wins':wins,'losses':max(0,closed_total-wins),
+                'total_pnl':float(atp.get('cash') or 0),'total_pnl_pct':float(atp.get('pct') or 0),
+                'pnl_24h':float(p24.get('cash') or 0),
+                'equity':float((overview.get('equity') or {}).get('value') or 0)}
+    closed=[]
+    for page in (1,2):
+        value=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':False,'params':{'page':page,'size':50}})
+        batch=value.get('investmentsTicker')
+        if not isinstance(batch,list): raise SourceDataError('Missing closed-position page')
+        closed.extend(batch)
+        if len(batch)<50: break
+    opened=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':1,'size':50}}).get('investmentsTicker') or []
+    closed_total=int(float(portfolio.get('closedPositions') or 0))
+    open_now=int(float(portfolio.get('openPositions') or 0))
+    closed_recent=[x for x in closed if recent(x.get('closedAt'))]
+    opened_recent=sum(1 for x in opened if recent(x.get('createdAt')))
+    win_rate=float(portfolio.get('winRate') or 0)
+    wins=int(round(win_rate/100.0*closed_total)) if closed_total else 0
+    pnl_24h=0.0
+    for x in closed_recent:
+        try: pnl_24h+=float(x.get('lastSim') or 0)-float(x.get('entrySim') or 0)
+        except (TypeError, ValueError): pass
+    return {'profile':profile,'portfolio_title':portfolio.get('title'),'type':'paper','unit':'sim',
+            'open_now':open_now,'trades_24h':len(closed_recent)+opened_recent,
+            'closed_24h':len(closed_recent),'opened_24h':opened_recent,
+            'total_trades':closed_total+open_now,'wins':wins,'losses':max(0,closed_total-wins),
+            'total_pnl':float(portfolio.get('plSnapshot') or 0),'total_pnl_pct':None,
+            'pnl_24h':pnl_24h,'equity':None}

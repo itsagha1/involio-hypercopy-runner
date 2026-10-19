@@ -475,7 +475,10 @@ def fetch_closed_map() -> Dict[str, Dict[str, Any]]:
     {ticker, closedAt, reason}}. Involio closed records reference the original
     open investment id in baseId."""
     merged: Dict[str, Dict[str, Any]] = {}
-    for name, pid in zip(PROFILE_NAMES, PORTFOLIO_IDS):
+    # indexed loop (owner 2026-10-19): a profile may bind MULTIPLE portfolios
+    # (luxora Treasury + Odyssey); zip() silently dropped extras.
+    for i, pid in enumerate(PORTFOLIO_IDS):
+        name = PROFILE_NAMES[i] if i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
         merged.update(source_api.fetch_closed_base_ids(name, pid, pages=2))
     return merged
 
@@ -517,6 +520,21 @@ def poll_once() -> None:
     except Exception as e:
         state["errors_last_run"] = state.get("errors_last_run", 0) + 1
         log_action(f"ERROR source fetch: {type(e).__name__}: {e}; retry next poll")
+    # --- per-source dashboard stats (owner 2026-10-19); failure is non-fatal ---
+    try:
+        _stats: Dict[str, Any] = {}
+        for _i, _pid in enumerate(PORTFOLIO_IDS):
+            _name = PROFILE_NAMES[_i] if _i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
+            _st = source_api.fetch_source_stats(_name, _pid)
+            if _name in _stats:
+                for _k in ("trades_24h", "closed_24h", "opened_24h", "total_trades",
+                           "wins", "losses", "total_pnl", "pnl_24h", "open_now"):
+                    _stats[_name][_k] = float(_stats[_name].get(_k) or 0) + float(_st.get(_k) or 0)
+            else:
+                _stats[_name] = _st
+        state["source_stats"] = _stats
+    except Exception as _e:
+        log_action(f"LOG source-stats refresh failed ({type(_e).__name__}: {str(_e)[:80]})")
         save_state(state)
         return
 
@@ -843,6 +861,7 @@ def status():
             "source_missing": state.get("source_missing", {}),
             "skip_watch": state.get("skip_watch", {}),
             "manual": state.get("manual", []),
+            "source_stats": state.get("source_stats", {}),
             "log_tail": [l.strip() for l in log_tail(20)]}
 
 

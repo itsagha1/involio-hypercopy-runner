@@ -1507,6 +1507,27 @@ def health():
             "errors_last_run":state.get("errors_last_run",0),"risk_manager_alive":bool(RISK_TASK and not RISK_TASK.done()),"risk_interval_seconds":2}
 
 
+_SOURCE_STATS_CACHE = {"ts": 0.0, "stats": {}}
+
+def fleet_source_stats():
+    """Per-source performance stats for the dashboard (owner 2026-10-19),
+    cached 5 minutes so /status/all stays fast."""
+    import time as _t
+    if _t.time() - _SOURCE_STATS_CACHE["ts"] < 300 and _SOURCE_STATS_CACHE["stats"]:
+        return _SOURCE_STATS_CACHE["stats"]
+    try:
+        from source_api import fetch_source_stats, PROFILES as _P
+        out = {}
+        for _n, _p in _P.items():
+            try: out[_n] = fetch_source_stats(_n, _p)
+            except Exception: pass
+        if out:
+            _SOURCE_STATS_CACHE["stats"] = out
+            _SOURCE_STATS_CACHE["ts"] = _t.time()
+    except Exception:
+        pass
+    return _SOURCE_STATS_CACHE["stats"]
+
 @app.get("/status/all")
 def status_all(x_signature: str = Header(default="")):
     """Owner fleet overview (2026-10-16): combined live status of the main mirror
@@ -1541,9 +1562,10 @@ def status_all(x_signature: str = Header(default="")):
         "dry_run": main.get("dry_run"),
         "hold_new": main.get("hold_new"),
         "risk_manager_alive": main.get("risk_manager_alive"),
+        "source_stats": fleet_source_stats(),
     })
     copies = [
-        (8001, "copy-mainport", "henderson_14"), (8002, "copy-bakery", "nathanbrown"),
+        (8001, "copy-mainport", "henderson_14+billionaireboysclub"), (8002, "copy-bakery", "nathanbrown"),
         (8003, "copy-scalping", "luxora"), (8004, "copy-kings", "xk1ngss"),
         (8005, "copy-bluespire", "bluespire+b4451"),
     ]
@@ -1555,7 +1577,7 @@ def status_all(x_signature: str = Header(default="")):
                 d = json.loads(r.read().decode())
             retained = d.get("retained", [])
             if isinstance(retained, dict):
-                retained = list(retained.values())
+                retained = [dict(v, profile=str(k).split("|")[0]) for k, v in retained.items()]
             mirrored = d.get("mirrored", {}) or {}
             if not isinstance(mirrored, dict):
                 mirrored = {}
@@ -1575,6 +1597,7 @@ def status_all(x_signature: str = Header(default="")):
                 "dry_run": d.get("dry_run"),
                 "hold_new": None,
                 "risk_manager_alive": True,
+                "source_stats": (d.get("source_stats") or {}),
             })
         except Exception as e:
             accounts.append({"id": name, "name": name, "port": port, "ok": False,
