@@ -88,7 +88,72 @@ def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=No
             'snapshot_at':datetime.now(timezone.utc).isoformat(),
             'source_total_fees':sims.get('portfolioTotalFeeSim')}
 
+def fetch_dex_book(session, profile=PROFILE, portfolio_id=None, portfolio=None):
+    """Owner 2026-10-19: LIVE portfolios (type='live', e.g. billionaireboysclub)
+    serve their books from the /dex/ endpoint family, NOT the v1_0 investments
+    API. Normalized to the same shape as the sim book so copy_listener needs no
+    changes. sizing: size.pct is the notional allocation % of equity, size.cash
+    is the notional; margin = cash / leverage; roi from net pnl pct."""
+    allowed = {x.strip() for x in str(profile).split(',') if x.strip()}
+    if not allowed: raise SourceDataError('Unauthorized source profile')
+    for name in allowed:
+        if name not in PROFILES: raise SourceDataError('Unauthorized source profile')
+    if portfolio is None or portfolio.get('id') != portfolio_id:
+        raise SourceDataError('Wrong or incomplete source portfolio')
+    if (portfolio.get('owner') or {}).get('username') not in allowed:
+        raise SourceDataError('Wrong source owner')
+    def get(path, params=None):
+        response=session.get(BASE+path, params=params or {}, timeout=25)
+        response.raise_for_status()
+        value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('DEX API failed for '+path)
+        return value.get('data') or {}
+    data=get('/dex/portfolio/position/'+str(portfolio_id)+'/list', {'isOpen':'true','limit':'100'})
+    raw=data.get('positions')
+    if not isinstance(raw, list): raise SourceDataError('Missing DEX open-position list')
+    overview=get('/dex/portfolio/live/'+str(portfolio_id)+'/overview')
+    equity=positive((overview.get('equity') or {}).get('value'), 'DEX equity')
+    positions=[];keys=set();ids=set()
+    for p in raw:
+        identity=str(p.get('id') or '')
+        ticker=str(p.get('assetSymbol') or '')
+        side=str(p.get('side') or '')
+        if not identity or identity in ids or not ticker or side not in ('long','short'):
+            raise SourceDataError('Missing/invalid DEX trade identity')
+        ids.add(identity)
+        key=ticker+'/'+side
+        if key in keys: raise SourceDataError('Duplicate source symbol/side; cannot safely aggregate')
+        keys.add(key)
+        leverage=positive(p.get('leverage'), 'leverage')
+        entry=positive(p.get('entryPx'), 'entry price')
+        current=positive(p.get('markPx'), 'mark price')
+        cash=positive((p.get('size') or {}).get('cash'), 'DEX position cash')
+        pct=positive((p.get('size') or {}).get('pct'), 'declared allocation percentage')
+        if pct>100: raise SourceDataError('Invalid declared allocation percentage')
+        try: net_pct=float(((p.get('pnl') or {}).get('net') or {}).get('pct') or 0)
+        except (TypeError, ValueError): raise SourceDataError('Invalid DEX net pnl')
+        margin=cash/leverage
+        positions.append({'source_id':identity,'ticker':ticker,'side':side,
+                          'source_margin':margin,'source_qty':cash/entry,
+                          'source_allocation_pct':pct,'allocation_verified':True,
+                          'entry_sim':margin,'last_sim':margin*(1.0+net_pct/100.0),
+                          'entry_price':entry,'current_price':current,'leverage':leverage,
+                          'stop_loss':p.get('stopLossPx'),
+                          'price_target':p.get('takeProfitPx'),
+                          'created_at':p.get('openedAt'),'updated_at':p.get('openedAt')})
+    remaining=equity-sum(pp['source_margin'] for pp in positions)
+    if not math.isfinite(remaining) or remaining<0: raise SourceDataError('Invalid DEX source cash balance')
+    return {'positions':positions,'source_equity':equity,'equity_verified':True,
+            'source_equity_basis':'dex_live_overview_equity',
+            'allocation_basis':'declared_size_pct',
+            'source_portfolio_id':portfolio_id,'source_profile':profile,
+            'remaining_sim':remaining,'complete':True,
+            'snapshot_at':datetime.now(timezone.utc).isoformat()}
+
+
 def fetch_source_book(profile=PROFILE, portfolio_id=None):
+
     if portfolio_id is None:
         if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
         portfolio_id=PROFILES[profile]
@@ -108,6 +173,8 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
             raise SourceDataError('Source API failed for '+path)
         return value
     metadata=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+    if (metadata.get('portfolio') or {}).get('type') == 'live':
+        return fetch_dex_book(session, profile, portfolio_id, metadata.get('portfolio'))
     positions=[]
     for page in range(1,22):
         if page>20: raise SourceDataError('Source pagination exceeded safety bound')
@@ -137,7 +204,19 @@ def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
     access=response.json().get('accessToken')
     if not access: raise SourceDataError('Involio refresh did not return access token')
     session.headers['Authorization']='Bearer '+access
+    meta=session.post(BASE+'/v1_0/portfolios/get_portfolio_by_id',json={'portfolioId':portfolio_id},timeout=25)
+    meta.raise_for_status();meta=meta.json()
+    if meta.get('success') is not True or (meta.get('portfolio') or {}).get('id') != portfolio_id:
+        raise SourceDataError('Source API failed for portfolio metadata')
     closed={}
+    if (meta.get('portfolio') or {}).get('type') == 'live':
+        response=session.get(BASE+'/dex/portfolio/position/'+str(portfolio_id)+'/list',params={'isOpen':'false','limit':'100'},timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('DEX closed-list failed')
+        for x in (value.get('data') or {}).get('positions') or []:
+            closed[str(x.get('id'))]={'ticker':x.get('assetSymbol'),'closedAt':x.get('closedAt'),'reason':x.get('closeReason')}
+        return closed
     for page in range(1,max(1,int(pages))+1):
         response=session.post(BASE+'/v1_0/investments/get_investments',json={'portfolioId':portfolio_id,'isOpen':False,'params':{'page':page,'size':50}},timeout=25)
         response.raise_for_status();value=response.json()

@@ -51,7 +51,7 @@ import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
-APP_VERSION = "c1.0.7"
+APP_VERSION = "c1.0.8"
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PROFILE_NAMES = [x.strip() for x in PROFILE.split(",") if x.strip()]
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
