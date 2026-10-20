@@ -213,6 +213,25 @@ class BybitClient:
                 break
         return total
 
+    def get_closed_pnl_records(self, start_time_ms: int = None, max_pages: int = 10) -> list:
+        """Raw closed-position records (owner 2026-10-20) for per-source mirror
+        stats on the dashboard: symbol, side, qty, closedPnl, createdTime/updatedTime.
+        Bybit rejects startTime older than 2 years, so the default window is 730 days."""
+        out, cursor, guard = [], "", 0
+        while guard < max(1, int(max_pages)):
+            guard += 1
+            params = {"category": "linear", "limit": 200}
+            if start_time_ms:
+                params["startTime"] = int(start_time_ms)
+            if cursor:
+                params["cursor"] = cursor
+            res = self._get("/v5/position/closed-pnl", params)
+            out.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor") or ""
+            if not cursor:
+                break
+        return out
+
     def get_positions(self, symbol: str | None = None) -> list:
         params = {"category": "linear", "settleCoin": "USDT", "limit": 200}
         if symbol:

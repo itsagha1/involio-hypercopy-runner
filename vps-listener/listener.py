@@ -1528,6 +1528,38 @@ def fleet_source_stats():
         pass
     return _SOURCE_STATS_CACHE["stats"]
 
+_MAIN_MIRROR_STATS = {"ts": 0.0, "data": None}
+
+def main_mirror_stats(mirrored):
+    """Owner 2026-10-20: per-source stats of the trades THIS account mirrored
+    (actions log joined to Bybit closed-PnL records) plus cumulative realized
+    P/L. Cached 5 minutes; failure degrades to the previous payload."""
+    import time as _t
+    if _MAIN_MIRROR_STATS["data"] is not None and _t.time() - _MAIN_MIRROR_STATS["ts"] < 300:
+        return _MAIN_MIRROR_STATS["data"]
+    try:
+        from mirror_stats import build as _build
+        client = BybitClient()
+        if not client.configured:
+            return _MAIN_MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
+        recs = client.get_closed_pnl_records()
+        lines = []
+        try:
+            with open(LOG_FILE) as f:
+                lines = f.readlines()
+        except OSError:
+            lines = []
+        current_open = {}
+        for k in (mirrored or {}):
+            prof = str(k).split("|")[0].split(",")[0]
+            current_open[str(k)] = prof
+        data = _build(lines, recs, None, current_open, None)
+        _MAIN_MIRROR_STATS["data"] = data
+        _MAIN_MIRROR_STATS["ts"] = _t.time()
+        return data
+    except Exception:
+        return _MAIN_MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
+
 @app.get("/status/all")
 def status_all(x_signature: str = Header(default="")):
     """Owner fleet overview (2026-10-16): combined live status of the main mirror
@@ -1546,6 +1578,7 @@ def status_all(x_signature: str = Header(default="")):
         main = health()
     except Exception as e:
         main = {"ok": False, "status": "error", "error": str(e)[:200]}
+    _ms = main_mirror_stats(main.get("mirrored", {}))
     accounts.append({
         "id": "main", "name": "Main (booobsas+akira+oozypath)", "port": 8000,
         "version": main.get("code_version"), "ok": main.get("ok"),
@@ -1563,6 +1596,8 @@ def status_all(x_signature: str = Header(default="")):
         "hold_new": main.get("hold_new"),
         "risk_manager_alive": main.get("risk_manager_alive"),
         "source_stats": fleet_source_stats(),
+        "mirror_stats": _ms,
+        "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub"), (8002, "copy-bakery", "nathanbrown"),
@@ -1577,7 +1612,7 @@ def status_all(x_signature: str = Header(default="")):
                 d = json.loads(r.read().decode())
             retained = d.get("retained", [])
             if isinstance(retained, dict):
-                retained = [dict(v, profile=str(k).split("|")[0]) for k, v in retained.items()]
+                retained = [dict(v, profile=(v.get("profile") or str(k).split("|")[0].split(",")[0])) for k, v in retained.items()]
             mirrored = d.get("mirrored", {}) or {}
             if not isinstance(mirrored, dict):
                 mirrored = {}
@@ -1598,6 +1633,8 @@ def status_all(x_signature: str = Header(default="")):
                 "hold_new": None,
                 "risk_manager_alive": True,
                 "source_stats": (d.get("source_stats") or {}),
+                "mirror_stats": (d.get("mirror_stats") or {}),
+                "cumulative_pnl": d.get("cumulative_pnl"),
             })
         except Exception as e:
             accounts.append({"id": name, "name": name, "port": port, "ok": False,

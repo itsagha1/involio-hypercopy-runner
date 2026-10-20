@@ -427,7 +427,7 @@ def handle_source_lost(client: BybitClient, rec_key: str, state: Dict[str, Any])
         client.set_sl_tp(symbol, stop_loss=0, take_profit=tp, position_idx=position_idx(symbol, side))
         act_thresh = fee_be * (1.0 + TP_TRIGGER_OFFSET) if side == "long" else fee_be * (1.0 - TP_TRIGGER_OFFSET)
         state.setdefault("retained", {})[key] = {
-            "symbol": symbol, "side": side, "qty": qty, "entry": avg,
+            "profile": rec.get("profile"), "symbol": symbol, "side": side, "qty": qty, "entry": avg,
             "fee_be": fee_be, "tp_trigger": tp, "activation_threshold": act_thresh,
             "status": "pending", "best_price": mark, "current_sl": None,
             "source_tp": src_tp,
@@ -447,6 +447,55 @@ def state_get() -> Dict[str, Any]:
     return _GLOBAL_STATE["state"]
 
 
+_MIRROR_STATS = {"ts": 0.0, "data": None}
+
+def mirror_stats_payload():
+    """Owner 2026-10-20: per-source stats of the trades WE mirrored (actions log
+    joined to Bybit closed-PnL records) plus the account's cumulative realized
+    P/L. Cached 5 minutes. Failure degrades to the previous payload."""
+    import time as _t
+    if _MIRROR_STATS["data"] is not None and _t.time() - _MIRROR_STATS["ts"] < 300:
+        return _MIRROR_STATS["data"]
+    client = BybitClient()
+    if not client.configured or DRY_RUN:
+        return _MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
+    try:
+        from mirror_stats import build as _ms_build
+        recs = client.get_closed_pnl_records()
+        try:
+            with open(LOG_FILE) as f:
+                lines = f.readlines()
+        except OSError:
+            lines = []
+        state = state_get()
+        idmap = {}
+        current_open = {}
+        for k, rec in list((state.get("mirrored") or {}).items()):
+            prof = rec.get("profile") or str(k).split("|")[0].split(",")[0]
+            current_open[str(k)] = prof
+            if rec.get("profile") and rec.get("source_id"):
+                idmap[str(rec["source_id"])] = rec["profile"]
+        for p in (state.get("books") or {}).get("positions") or []:
+            if p.get("profile") and p.get("source_id"):
+                idmap[str(p["source_id"])] = p["profile"]
+        for k, rec in list((state.get("retained") or {}).items()):
+            if rec.get("profile") and rec.get("source_id"):
+                idmap[str(rec["source_id"])] = rec["profile"]
+        try:
+            for _i, _pid in enumerate(PORTFOLIO_IDS):
+                _name = PROFILE_NAMES[_i] if _i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
+                for _bid in source_api.fetch_closed_base_ids(_name, _pid, pages=2):
+                    idmap.setdefault(str(_bid), _name)
+        except Exception:
+            pass
+        data = _ms_build(lines, recs, idmap, current_open, coin_to_symbol)
+        _MIRROR_STATS["data"] = data
+        _MIRROR_STATS["ts"] = _t.time()
+        return data
+    except Exception:
+        return _MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
+
+
 def fetch_merged_books(profile: str) -> Dict[str, Any]:
     """Fetch and merge the books of every portfolio bound to this subaccount.
     COPY_PORTFOLIO_ID may be a comma-separated list (owner 2026-10-13: luxora
@@ -456,10 +505,12 @@ def fetch_merged_books(profile: str) -> Dict[str, Any]:
     positions: List[Dict[str, Any]] = []
     equity = 0.0
     remaining = 0.0
-    for pid in PORTFOLIO_IDS:
-        book = source_api.fetch_source_book(profile, pid)
+    for i, pid in enumerate(PORTFOLIO_IDS):
+        name = PROFILE_NAMES[i] if i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
+        book = source_api.fetch_source_book(name, pid)
         for p in book.get("positions", []):
             p["portfolio"] = pid[:8]
+            p["profile"] = name
             positions.append(p)
         equity += float(book.get("source_equity") or 0)
         remaining += float(book.get("remaining_sim") or 0)
@@ -541,6 +592,15 @@ def poll_once() -> None:
     prev = state.get("books")
     positions = book.get("positions", [])
     by_id = {p["source_id"]: p for p in positions}
+    # owner 2026-10-20: per-record source attribution for the dashboard. The
+    # mirrored KEY carries the account-level profile string (which may be
+    # comma-joined for multi-profile subaccounts); the RECORD now carries the
+    # actual per-trade profile from the book it was mirrored from.
+    for _rk, _rec in list(state.get("mirrored", {}).items()):
+        if "profile" not in _rec:
+            _p = by_id.get(str(_rk.split("|")[-1]))
+            if _p is not None and _p.get("profile"):
+                _rec["profile"] = _p["profile"]
 
     if prev is None:
         # First run: baseline everything; only FUTURE trades are mirrored.
@@ -851,8 +911,10 @@ def status():
             wallet = s.get("wallet_balance")
         except BybitError as e:
             bybit["error"] = str(e)
+    _ms = mirror_stats_payload()
     return {"ok": True, "code_version": APP_VERSION, "name": NAME, "profile": PROFILE,
             "portfolio_id": PORTFOLIO_ID, "dry_run": DRY_RUN, "armed": state.get("armed"),
+            "mirror_stats": _ms, "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
             "last_poll": state.get("last_poll"), "errors_last_run": state.get("errors_last_run"),
             "wallet": wallet, "bybit": bybit,
             "baseline_count": len(state.get("baseline", [])),
