@@ -131,7 +131,11 @@ def save_state(state: Dict[str, Any]) -> None:
 
 
 def tkey(p: Dict[str, Any]) -> str:
-    return f"{PROFILE}|{p['ticker']}/{p['side']}|{p['source_id']}"
+    # Owner 2026-10-20: the key uses the PER-POSITION source profile (tagged by
+    # fetch_merged_books from the portfolio the trade came from), never the
+    # account-level COPY_PROFILE string - adding a profile to a subaccount no
+    # longer rewrites the keys of existing mirrors.
+    return f"{p.get('profile') or PROFILE}|{p['ticker']}/{p['side']}|{p['source_id']}"
 
 
 def bybit_key(p: Dict[str, Any]) -> str:
@@ -571,6 +575,8 @@ def poll_once() -> None:
     except Exception as e:
         state["errors_last_run"] = state.get("errors_last_run", 0) + 1
         log_action(f"ERROR source fetch: {type(e).__name__}: {e}; retry next poll")
+        return  # never continue without a book (was an UnboundLocalError crash)
+
     # --- per-source dashboard stats (owner 2026-10-19); failure is non-fatal ---
     try:
         _stats: Dict[str, Any] = {}
