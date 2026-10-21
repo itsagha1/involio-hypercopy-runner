@@ -1776,6 +1776,16 @@ def risk_tick():
     client=BybitClient()
     if client.configured and not DRY_RUN:
         refresh_account_cache(client)
+        # owner 2026-10-21: immediate 70% margin-breach alert (WhatsApp)
+        try:
+            import margin_alert as _ma
+            _acct = ACCOUNT_CACHE.get("account") or {}
+            _w = _acct.get("wallet_balance")
+            if _w and time.time() - (ACCOUNT_CACHE.get("ok_ts") or 0) < 300:
+                _ma.check("main", float(_w), ACCOUNT_CACHE.get("positions") or [],
+                          os.environ.get("WEBHOOK_SHARED_SECRET", ""), log_action)
+        except Exception:
+            pass
     with STATE_LOCK:
         state=load_state()
         if DRY_RUN or not (state.get("retained_trailing") or state.get("parked_ambiguous")):return

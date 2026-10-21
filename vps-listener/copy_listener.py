@@ -577,6 +577,17 @@ def poll_once() -> None:
         log_action(f"ERROR source fetch: {type(e).__name__}: {e}; retry next poll")
         return  # never continue without a book (was an UnboundLocalError crash)
 
+    # --- owner 2026-10-21: immediate 70% margin-breach alert (WhatsApp) ---
+    try:
+        if not (DRY_RUN or not client.configured):
+            from margin_alert import check as _margin_check
+            _s = client.get_account_summary()
+            _pos = [p for p in client.get_positions() if float(p.get("size") or 0) > 0]
+            _margin_check(NAME, float(_s.get("wallet_balance") or 0), _pos,
+                          os.environ.get("WEBHOOK_SHARED_SECRET", ""), log_action)
+    except Exception as _e:
+        log_action(f"LOG margin monitor failed ({type(_e).__name__}: {str(_e)[:60]})")
+
     # --- per-source dashboard stats (owner 2026-10-19); failure is non-fatal ---
     try:
         _stats: Dict[str, Any] = {}
