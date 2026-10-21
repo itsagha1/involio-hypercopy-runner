@@ -43,7 +43,7 @@ LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 STATE_VERSION = 3
 LISTENER_VERSION = "v3.7.4"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
-AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath"}
+AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath", "_k2_"}
 
 PROFIT_SKIP_ROI = 0.02            # owner rule 2026-10-13: skip new trades already >= +2% source ROI on margin, with auto re-entry watch below 2%
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
