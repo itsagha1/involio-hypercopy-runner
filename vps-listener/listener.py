@@ -876,6 +876,19 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
         return f"ERROR {key} source_close: {e}"
 
 
+MIRROR_CACHE={"ts":0.0,"data":{}}
+MIRROR_TTL_S=10.0
+def throttled_open_mirrors(client: BybitClient) -> Dict[str, Dict[str, Any]]:
+    # 2026-10-21: the 2s risk loop was issuing /v5/position/list every tick
+    # (>150 per 5-min window) while a retained position existed, tripping
+    # Bybit retCode=10006. TTL-cache the mirror set; the trailing ratchet
+    # still evaluates every 2s off live tickers (public, high limit).
+    now=time.time()
+    if now-MIRROR_CACHE["ts"]>=MIRROR_TTL_S:
+        MIRROR_CACHE["data"]=fetch_open_mirrors(client)
+        MIRROR_CACHE["ts"]=now
+    return MIRROR_CACHE["data"]
+
 def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -> List[str]:
     """Local 2-second code-only manager for retained bot-owned positions.
     Ratchets exchange hard SL = max(BE, best*.99) long / min(BE, best*1.01) short.
@@ -887,7 +900,7 @@ def manage_retained_trailing_stops(client: BybitClient, state: Dict[str, Any]) -
     if not retained_dict:
         return logs
 
-    open_mirrors = fetch_open_mirrors(client) if client.configured else {}
+    open_mirrors = throttled_open_mirrors(client) if client.configured else {}
 
     for key in list(retained_dict.keys()):
         ret = retained_dict[key]
@@ -1756,7 +1769,10 @@ def refresh_account_cache(client: BybitClient) -> None:
     except BybitError as e:
         ACCOUNT_CACHE["error"]=str(e)
 
+RATE_COOLDOWN={"until":0.0}
 def risk_tick():
+    if time.time()<RATE_COOLDOWN["until"]:
+        return
     client=BybitClient()
     if client.configured and not DRY_RUN:
         refresh_account_cache(client)
@@ -1771,7 +1787,11 @@ async def risk_loop():
     while True:
         try:await run_in_threadpool(risk_tick)
         except asyncio.CancelledError:raise
-        except Exception as e:log_action(f"ERROR risk manager: {type(e).__name__}: {e}; exchange stops preserved")
+        except Exception as e:
+            log_action(f"ERROR risk manager: {type(e).__name__}: {e}; exchange stops preserved")
+            if "10006" in str(e):
+                RATE_COOLDOWN["until"]=time.time()+60
+                log_action("LOG risk manager: API rate limit - pausing exchange calls 60s (exchange stops preserved)")
         await asyncio.sleep(2)
 
 @app.on_event("startup")
