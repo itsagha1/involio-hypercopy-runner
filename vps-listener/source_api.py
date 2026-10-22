@@ -134,8 +134,19 @@ def fetch_dex_book(session, profile=PROFILE, portfolio_id=None, portfolio=None):
         try: net_pct=float(((p.get('pnl') or {}).get('net') or {}).get('pct') or 0)
         except (TypeError, ValueError): raise SourceDataError('Invalid DEX net pnl')
         margin=cash/leverage
+        # Owner 2026-10-22 qty-basis fix: size.coin/leverage is the EXACT coin
+        # quantity (verified: coin/lev == cash/markPx on every DEX position).
+        # size.cash is MARK-TO-MARKET notional (qty x markPx), so the previous
+        # cash/entryPx qty drifted with the market every poll and produced
+        # phantom size-sync adds/reduces on live-portfolio mirrors (RUNE case).
+        coin_qty=0.0
+        try:
+            _coin=(p.get('size') or {}).get('coin')
+            if _coin and leverage: coin_qty=float(_coin)/leverage
+        except (TypeError, ValueError): coin_qty=0.0
+        qty=coin_qty if coin_qty>0 else (cash/current if current else cash/entry)
         positions.append({'source_id':identity,'ticker':ticker,'side':side,
-                          'source_margin':margin,'source_qty':cash/entry,
+                          'source_margin':margin,'source_qty':qty,
                           'source_allocation_pct':pct,'allocation_verified':True,
                           'entry_sim':margin,'last_sim':margin*(1.0+net_pct/100.0),
                           'entry_price':entry,'current_price':current,'leverage':leverage,
