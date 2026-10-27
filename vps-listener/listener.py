@@ -1579,6 +1579,8 @@ def main_mirror_stats(mirrored):
     except Exception:
         return _MAIN_MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
 
+_LAST_GOOD_ACCOUNTS: Dict[str, Any] = {}
+
 def _build_fleet_snapshot():
     """Owner fleet overview (2026-10-16): combined live status of the main mirror
     account (this listener) and every dedicated copy subaccount listener
@@ -1621,7 +1623,7 @@ def _build_fleet_snapshot():
         try:
             req = urllib.request.Request("http://127.0.0.1:%d/status" % port,
                                          headers={"X-Internal-Status": "1"})
-            with urllib.request.urlopen(req, timeout=6) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 d = json.loads(r.read().decode())
             retained = d.get("retained", [])
             if isinstance(retained, dict):
@@ -1650,8 +1652,22 @@ def _build_fleet_snapshot():
                 "cumulative_pnl": d.get("cumulative_pnl"),
             })
         except Exception as e:
-            accounts.append({"id": name, "name": name, "port": port, "ok": False,
-                             "error": "%s: %s" % (type(e).__name__, str(e)[:150])})
+            # Owner 2026-10-27: a copy /status fetch can exceed the timeout while
+            # its 5-minute stats caches recompute (log + Bybit closed-PnL joins).
+            # Serve the LAST GOOD entry, marked stale, instead of an empty error
+            # entry that breaks the dashboard (zero wallet, blank version).
+            prev = _LAST_GOOD_ACCOUNTS.get(name)
+            if prev:
+                entry = dict(prev)
+                entry["stale"] = True
+                entry["stale_error"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+                accounts.append(entry)
+            else:
+                accounts.append({"id": name, "name": name, "port": port, "ok": False,
+                                 "error": "%s: %s" % (type(e).__name__, str(e)[:150])})
+    for _acc in accounts:
+        if isinstance(_acc, dict) and _acc.get("id") and _acc.get("ok") and not _acc.get("stale"):
+            _LAST_GOOD_ACCOUNTS[_acc.get("id")] = _acc
     return {"ok": all(a.get("ok") for a in accounts), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "accounts": accounts}
 
