@@ -569,6 +569,12 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
         desired_margin, err = compute_desired_margin(p, book_info, wallet)
         if err:
             return f"SKIP {key} new_entry: {err}", None
+        # Owner 2026-10-28: never OPEN a position whose allocation exceeds 20%
+        # of wallet (1:1 pct sizing => desired margin > 20% of wallet).
+        # Size increases on existing mirrors are exempt (sync_size uncapped).
+        if wallet > 0 and desired_margin > 0.20 * wallet:
+            return (f"SKIP {key} new_entry: desired margin {desired_margin:.2f} exceeds 20% of wallet "
+                    f"({wallet:.2f}) - no oversized entries", None)
 
         desired_notional = desired_margin * lev
         min_notional = max(MIN_NOTIONAL, float(inst.get("lotSizeFilter", {}).get("minNotionalValue") or MIN_NOTIONAL))
@@ -1615,7 +1621,7 @@ def _build_fleet_snapshot():
         "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
     })
     copies = [
-        (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx"), (8002, "copy-bakery", "nathanbrown"),
+        (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx"), (8002, "copy-bakery", "nathanbrown+retrace"),
         (8003, "copy-scalping", "luxora+nicush+leomessi"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
         (8005, "copy-bluespire", "bluespire+b4451+lagostini"),
     ]

@@ -221,6 +221,12 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
         dm, err = desired_margin(p, wallet)
         if err:
             return f"SKIP {key} new_entry: {err}", None
+        # Owner 2026-10-28: never OPEN a position whose allocation exceeds 20%
+        # of wallet (1:1 pct sizing => desired margin > 20% of wallet).
+        # Size increases on existing mirrors are exempt (sync_size uncapped).
+        if wallet > 0 and dm > 0.20 * wallet:
+            return (f"SKIP {key} new_entry: desired margin {dm:.2f} exceeds 20% of wallet "
+                    f"({wallet:.2f}) - no oversized entries", None)
         notional = dm * lev
         min_notional = max(MIN_NOTIONAL, float(inst.get("lotSizeFilter", {}).get("minNotionalValue") or MIN_NOTIONAL))
 
