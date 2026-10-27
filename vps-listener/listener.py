@@ -1620,7 +1620,7 @@ def status_all(x_signature: str = Header(default="")):
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx"), (8002, "copy-bakery", "nathanbrown"),
-        (8003, "copy-scalping", "luxora+nicush+leomessi"), (8004, "copy-kings", "xk1ngss+sid+rareone"),
+        (8003, "copy-scalping", "luxora+nicush+leomessi"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
         (8005, "copy-bluespire", "bluespire+b4451+lagostini"),
     ]
     for port, name, profile in copies:
