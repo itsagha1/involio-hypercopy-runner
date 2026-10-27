@@ -1579,19 +1579,13 @@ def main_mirror_stats(mirrored):
     except Exception:
         return _MAIN_MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
 
-@app.get("/status/all")
-def status_all(x_signature: str = Header(default="")):
+def _build_fleet_snapshot():
     """Owner fleet overview (2026-10-16): combined live status of the main mirror
     account (this listener) and every dedicated copy subaccount listener
     (127.0.0.1:8001-8005). Protected by the same shared secret as the webhook so
     it is safe to expose through the Cloudflare tunnel for the HyperCopy
     dashboard. Never calls Bybit directly - serves cached snapshots."""
     import urllib.request, urllib.error
-    secret = get_shared_secret()
-    if not secret:
-        raise HTTPException(500, "listener secret not configured")
-    if not hmac.compare_digest(x_signature, secret):
-        raise HTTPException(403, "bad signature")
     accounts = []
     try:
         main = health()
@@ -1660,6 +1654,38 @@ def status_all(x_signature: str = Header(default="")):
                              "error": "%s: %s" % (type(e).__name__, str(e)[:150])})
     return {"ok": all(a.get("ok") for a in accounts), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "accounts": accounts}
+
+_FLEET_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+
+def _fleet_warm_loop():
+    # Owner 2026-10-27: keep the fleet snapshot warm so the HyperCopy dashboard
+    # refresh is instant. Previously the dashboard waited 10-40s on cold caches
+    # (per-copy /status recompute + main health()), causing refresh errors and
+    # platform timeouts. The warm loop absorbs that cost in the background.
+    while True:
+        try:
+            _FLEET_CACHE["data"] = _build_fleet_snapshot()
+            _FLEET_CACHE["ts"] = time.time()
+        except Exception:
+            pass
+        time.sleep(60)
+
+threading.Thread(target=_fleet_warm_loop, daemon=True, name="fleet-warm").start()
+
+@app.get("/status/all")
+def status_all(x_signature: str = Header(default="")):
+    """Owner fleet overview: instant cached snapshot, warmed every 60s."""
+    secret = get_shared_secret()
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, secret):
+        raise HTTPException(403, "bad signature")
+    if _FLEET_CACHE["data"] is None:
+        _FLEET_CACHE["data"] = _build_fleet_snapshot()
+        _FLEET_CACHE["ts"] = time.time()
+    payload = dict(_FLEET_CACHE["data"])
+    payload["age_seconds"] = max(0, int(time.time() - _FLEET_CACHE["ts"]))
+    return payload
 
 @app.get("/log")
 def log_endpoint(n:int=400):
