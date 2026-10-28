@@ -470,6 +470,34 @@ def check_missed_mirrors(account, status, findings):
                      % needle, subject=needle)
 
 
+def process_start(unit):
+    """Timestamp the running process started - log lines older than this are
+    history (already-fixed bugs), not live findings."""
+    try:
+        out = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestamp', '--value', unit],
+                             capture_output=True, text=True, timeout=10)
+        txt = out.stdout.strip()
+        if not txt:
+            return None
+        parts = txt.split()
+        for i in range(len(parts) - 1):
+            if len(parts[i]) == 10 and parts[i][4] == '-' and ':' in parts[i + 1]:
+                return parse_ts('%sT%s' % (parts[i], parts[i + 1]))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def line_ts(line):
+    """Parse the leading '[2026-10-28 14:37:47 UTC]' stamp of an action log line."""
+    try:
+        if not line.startswith('['):
+            return None
+        return parse_ts(line[1:line.index(']')].replace(' UTC', '+00:00'))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def check_skip_signatures(account, status, findings):
     """D. known bug shapes in the recent log tail (current process run only)."""
     mirrors = mirrors_of(status)
@@ -560,14 +588,23 @@ def audit_account(name, port, is_main, findings, prev_keys, apply_fixes):
         return
     if not check_healthy(name, port, status, is_main, findings):
         return
+    checks = []
     if is_main:
-        check_main_reconciliation(status, findings)
-    check_labels(name, port, status, findings, prev_keys, apply_fixes=apply_fixes)
-    check_mirror_divergence(name, port, status, findings, prev_keys, apply_fixes=apply_fixes)
-    check_missed_mirrors(name, status, findings)
-    check_skip_signatures(name, status, findings)
-    check_funds_at_risk(name, status, findings)
-    check_margin_hold(name, status, findings)
+        checks.append(('main_reconciliation', lambda: check_main_reconciliation(status, findings)))
+    checks += [
+        ('labels', lambda: check_labels(name, port, status, findings, prev_keys, apply_fixes=apply_fixes)),
+        ('mirror_divergence', lambda: check_mirror_divergence(name, port, status, findings, prev_keys, apply_fixes=apply_fixes)),
+        ('missed_mirrors', lambda: check_missed_mirrors(name, status, findings)),
+        ('skip_signatures', lambda: check_skip_signatures(name, status, findings)),
+        ('funds_at_risk', lambda: check_funds_at_risk(name, status, findings)),
+        ('margin_hold', lambda: check_margin_hold(name, status, findings)),
+    ]
+    for label, fn in checks:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - one broken check must never kill the audit
+            findings.add(name, 'audit_check_error', 'high',
+                         'check %s crashed: %s: %s' % (label, type(e).__name__, e))
     ACCOUNT_SUMMARY[name] = {
         'mirrors': len(mirrors_of(status)),
         'manual': len(status.get('manual') or []),
