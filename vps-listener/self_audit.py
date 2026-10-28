@@ -42,6 +42,7 @@ hypercopy-audit.timer. Zero Base44 credits.
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -393,92 +394,80 @@ def baseline_count(account, status):
     return len(bl) if isinstance(bl, (list, tuple)) else 0
 
 
+def read_log(account, max_lines=1500):
+    """Tail of the account's action log (full file, not the 20-line /status tail)."""
+    path = os.path.join(STATE_DIR, '%s_actions.log' % account)
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 500000))
+            return f.read().decode('utf-8', 'replace').splitlines()[-max_lines:]
+    except OSError:
+        return []
+
+
 def check_missed_mirrors(account, status, findings):
-    """C. source holds open positions we cannot account for."""
-    src = status.get('source_stats') or {}
-    if not src:
-        return
-    # baseline entries carry no profile, so they form a shared pool that can
-    # legitimately cover part of the gap (positions opened before we mirrored).
-    baseline_pool = baseline_count(account, status)
-    mirrors = mirrors_of(status)
-    retained = status.get('retained') or {}
-    skip_watch = status.get('skip_watch') or {}
+    """C. source holds positions we are neither mirroring nor legitimately holding
+    back. Uses the engine's own source book (ground truth) and the full action log
+    for evidence, so baselined positions and legitimate skips are not false alarms."""
     st = load_state(account)
-    blocks = st.get('entry_blocks') or {}
-    log_tail = [str(l) for l in (status.get('log_tail') or [])]
+    book = ((st.get('books') or {}).get('positions') or [])
+    if not book:
+        if status.get('source_stats'):
+            findings.add(account, 'source_book_missing', 'info',
+                         'no cached source book this poll; gap check skipped')
+        return
 
-    for profile, stats in src.items():
-        try:
-            opens = int(stats.get('open_now') or 0)
-        except (TypeError, ValueError):
-            opens = 0
-        if opens <= 0:
+    log = read_log(account)
+    baseline_keys = set()
+    for line in log:
+        if 'baseline position' in line:
+            m = re.search(r'\|([^|\s]+)/([a-z]+)\|[^:\s]*:\s*baseline position', line)
+            if m:
+                baseline_keys.add((m.group(1).upper(), side_norm(m.group(2))))
+
+    covered = {}
+    for grp in ('mirrored', 'skip_watch', 'retained', 'entry_blocks'):
+        src = status.get(grp) or {}
+        if grp == 'retained' and isinstance(status.get('retained_trailing'), dict):
+            src = status.get('retained_trailing')
+        if grp == 'entry_blocks':
+            src = st.get('entry_blocks') or {}
+        if isinstance(src, dict):
+            for key in src:
+                parts = str(key).split('|')
+                if len(parts) >= 2:
+                    coin, _, sd = parts[1].partition('/')
+                    covered[(parts[0], coin.upper(), side_norm(sd))] = grp
+
+    unexplained = []
+    for pos in book:
+        profile = pos.get('profile')
+        coin = str(pos.get('ticker') or '').upper()
+        sd = side_norm(pos.get('side'))
+        if not profile or not coin:
             continue
-        mine_m = [k for k, m in mirrors.items() if m['profile'] == profile]
-        mine_r = [k for k in retained if k.split('|')[0] == profile]
-        mine_s = [k for k in skip_watch if k.split('|')[0] == profile]
-        mine_b = [k for k in blocks if str(k).split('|')[0] == profile]
-        accounted = len(mine_m) + len(mine_r) + len(mine_s) + len(mine_b)
-        if accounted >= opens:
+        if (profile, coin, sd) in covered:
             continue
-        gap = opens - accounted
-        if baseline_pool > 0:
-            covered = min(gap, baseline_pool)
-            baseline_pool -= covered
-            gap -= covered
-            if gap <= 0:
-                findings.add(account, 'source_gap_baselined', 'info',
-                             '%s holds %d open, %d accounted + %d baselined'
-                             % (profile, opens, accounted, covered))
-                continue
-        # can the log tail explain the per-poll skips (sub-minimum, conflict, hold)?
-        reasons = [l for l in log_tail if profile in l and
-                   ('SKIP' in l or 'SKIP-WATCH' in l or 'ERROR' in l)]
-        if reasons:
-            findings.add(account, 'source_gap_explained', 'info',
-                         '%s holds %d open, %d accounted (%d mirrors/%d retained/'
-                         '%d watch/%d blocked); recent skips explain the rest: %s'
-                         % (profile, opens, accounted, len(mine_m), len(mine_r),
-                            len(mine_s), len(mine_b), reasons[-1][-120:]))
+        if (coin, sd) in baseline_keys:
+            continue
+        # last log evidence for this exact trade family
+        needle = '%s|%s/%s' % (profile, coin, sd)
+        evidence = [ln for ln in log if needle in ln and
+                    any(w in ln for w in ('SKIP', 'RE-ENTRY', 'ERROR', 'degraded', 'baseline'))]
+        if evidence:
+            findings.add(account, 'source_skip_explained', 'info',
+                         '%s is not mirrored but the log explains it: %s'
+                         % (needle, evidence[-1][-130:]), subject=needle)
         else:
-            findings.add(account, 'source_gap_unexplained', 'high',
-                         '%s holds %d open position(s) but only %d are accounted '
-                         'for (%d mirrors, %d retained, %d skip-watch, %d blocked) '
-                         'and the log tail shows no skip reason - possible missed '
-                         'mirror, inspect the book'
-                         % (profile, opens, accounted, len(mine_m), len(mine_r),
-                            len(mine_s), len(mine_b)))
+            unexplained.append(needle)
 
-
-def process_start(unit):
-    """Timestamp the running process started - log lines older than this are
-    history (already-fixed bugs), not live findings."""
-    try:
-        out = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestamp', '--value', unit],
-                             capture_output=True, text=True, timeout=10)
-        txt = out.stdout.strip()
-        if not txt:
-            return None
-        # e.g. "Wed 2026-10-28 15:08:32 UTC"
-        parts = txt.split()
-        for i in range(len(parts) - 1):
-            if len(parts[i]) == 10 and parts[i][4] == '-' and ':' in parts[i + 1]:
-                stamp = '%sT%s' % (parts[i], parts[i + 1])
-                return parse_ts(stamp)
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-def line_ts(line):
-    """Parse the leading '[2026-10-28 14:37:47 UTC]' stamp of an action log line."""
-    try:
-        if not line.startswith('['):
-            return None
-        return parse_ts(line[1:line.index(']')].replace(' UTC', '+00:00'))
-    except Exception:  # noqa: BLE001
-        return None
+    for needle in unexplained:
+        findings.add(account, 'missed_mirror_suspect', 'high',
+                     '%s is open at the source but has no mirror, no skip-watch, no '
+                     'baseline and no skip reason in the log - possible missed trade'
+                     % needle, subject=needle)
 
 
 def check_skip_signatures(account, status, findings):
