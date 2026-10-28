@@ -1677,6 +1677,47 @@ def _build_fleet_snapshot():
     return {"ok": all(a.get("ok") for a in accounts), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "accounts": accounts}
 
+def _main_self_poll_loop():
+    # Owner 2026-10-28: near-realtime source monitoring. Fetches every authorized
+    # profile book on the VPS every 60s and delivers it through the standard
+    # /webhook/involio-delta endpoint (localhost, signed) - the exact same
+    # validated processing path as the Base44 5-minute poll, so the main account
+    # reacts to source changes in ~1 minute at zero Base44 credit cost. The
+    # Base44 poll keeps running for dashboard delta bookkeeping; duplicate
+    # deliveries are idempotent.
+    import requests as _rq
+    from source_api import fetch_source_book, SourceDataError
+    while True:
+        try:
+            books = {}
+            for profile in sorted(AUTHORIZED_PROFILES):
+                for attempt in range(3):
+                    try:
+                        books[profile] = fetch_source_book(profile)
+                        break
+                    except SourceDataError:
+                        if attempt == 2: break
+                        time.sleep(2 + attempt * 2)
+                    except _rq.exceptions.RequestException:
+                        if attempt == 2: break
+                        time.sleep(2 + attempt * 2)
+            if books:
+                st = load_state()
+                payload = {"source": "vps-self-poll", "fired_at": datetime.now(timezone.utc).isoformat(),
+                           "books": books, "recents": {}, "hold_new": bool(st.get("hold_new", False)),
+                           "cutover_action": None}
+                secret = get_shared_secret()
+                if secret:
+                    r = _rq.post("http://127.0.0.1:8000/webhook/involio-delta", json=payload,
+                                 headers={"X-Signature": secret}, timeout=120)
+                    if not r.ok:
+                        log_action(f"LOG self-poll delivery HTTP {r.status_code}; will retry next cycle")
+        except Exception:
+            pass
+        time.sleep(60)
+
+threading.Thread(target=_main_self_poll_loop, daemon=True, name="main-self-poll").start()
+
 _FLEET_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 
 def _fleet_warm_loop():
