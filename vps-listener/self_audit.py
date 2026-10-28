@@ -660,6 +660,7 @@ def main(argv):
         with open(tmp, 'w') as f:
             json.dump(report, f, indent=1)
         os.replace(tmp, REPORT_FILE)
+        os.chmod(REPORT_FILE, 0o644)  # readable without sudo (dashboard/digest tools)
     except OSError as e:
         print('WARN cannot write report: %s' % e, file=sys.stderr)
 
@@ -677,6 +678,7 @@ def main(argv):
     try:
         with open(AUDIT_LOG, 'a') as fh:
             fh.write('\n'.join(lines) + '\n')
+        os.chmod(AUDIT_LOG, 0o644)
     except OSError:
         pass
     print('\n'.join(lines))
