@@ -9,6 +9,58 @@ PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837'
 # networks. Env-overridable for any future migration.
 BASE = os.environ.get('INVOLIO_API_BASE', 'https://api.invoapp.com')
 
+# Owner 2026-10-28: network-level API-domain failover. The Invo platform
+# (app.invoapp.com) has run its API on two domains historically (legacy brand
+# api.involio.com, current api.invoapp.com). If the active host becomes
+# UNREACHABLE at the network level (connect/timeout - NOT HTTP app errors),
+# probe the known alternates; the first reachable one becomes the new BASE
+# (persisted to /tmp, global switch). Self-heals domain migrations without
+# human intervention. HTTP-level errors (500/401/etc) are surfaced unchanged.
+KNOWN_API_BASES=[b for b in ['https://api.invoapp.com','https://api.involio.com']]
+_API_BASE_CACHE_FILE='/tmp/involio_api_base.txt'
+
+def _persist_base(new_base):
+    global BASE
+    BASE=new_base
+    try:
+        with open(_API_BASE_CACHE_FILE,'w') as _f: _f.write(new_base)
+    except Exception:
+        pass
+
+class FailoverSession(requests.Session):
+    # Cloudflare origin-down codes mean the host itself is effectively dead
+    # (edge alive, origin unreachable) - same treatment as transport failures.
+    # Genuine app errors (401/404/500...) are surfaced to the caller unchanged.
+    _ORIGIN_DOWN=(520,521,522,523,524)
+
+    def request(self, method, url, **kwargs):
+        global BASE
+        first_err=None
+        try:
+            response=super().request(method, url, **kwargs)
+            host_down=response.status_code in self._ORIGIN_DOWN
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
+            first_err=err
+            response=None
+            host_down=True
+        if not host_down:
+            return response
+        if not url.startswith(BASE):
+            return response
+        for alt in [b for b in KNOWN_API_BASES if b != BASE]:
+            try:
+                response=super().request(method, alt+url[len(BASE):], **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                continue
+            if response.status_code in self._ORIGIN_DOWN:
+                continue
+            _persist_base(alt)
+            print('[source_api] API host failover: previous host down; switched BASE -> '+alt, flush=True)
+            return response
+        if first_err is not None:
+            raise first_err
+        return response
+
 class SourceDataError(RuntimeError):
     pass
 
@@ -187,7 +239,7 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
         portfolio_id=PROFILES[profile]
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
-    session=requests.Session()
+    session=FailoverSession()
     session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
     response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
     response.raise_for_status()
@@ -275,7 +327,7 @@ def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
         portfolio_id=PROFILES[profile]
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
-    session=requests.Session()
+    session=FailoverSession()
     session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
     response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
     response.raise_for_status()
@@ -324,7 +376,7 @@ def fetch_source_stats(profile=PROFILE, portfolio_id=None):
         portfolio_id = PROFILES[profile]
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
-    session=requests.Session()
+    session=FailoverSession()
     session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
     response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
     response.raise_for_status()

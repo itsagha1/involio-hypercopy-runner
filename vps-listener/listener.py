@@ -518,10 +518,10 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
             state.setdefault("manual", []).append(bk)
         return f"SKIP {key} new_entry: manual protect active for {bk} (never manage owner manual positions)", None
 
-    # owner 2026-10-21: no NEW entries while margin >= 70%; resume at <= 50%
+    # owner 2026-10-28: no NEW entries while margin >= 70%; resume at <= 40%
     if state.get("margin_hold"):
         return (f"SKIP {key} new_entry: margin hold active ({ACCOUNT_CACHE.get('margin_pct', 0):.1f}% used); "
-                f"entries resume when margin <= 50%", None)
+                f"entries resume when margin <= 40%", None)
 
     # Check for live position conflict on Bybit for same symbol/side
     try:
@@ -1977,18 +1977,18 @@ def risk_tick():
     with STATE_LOCK:
         state=load_state()
         # owner 2026-10-21: margin entry-hold - no NEW trades while margin >= 70%;
-        # entries resume once margin is back to <= 50%. Existing mirrors and
+        # entries resume once margin is back to <= 40% (owner 2026-10-28; was 50%). Existing mirrors and
         # retained positions keep running unchanged.
         _mp=ACCOUNT_CACHE.get("margin_pct")
         if _mp is not None and not DRY_RUN:
             if not state.get("margin_hold") and _mp>=70.0:
                 state["margin_hold"]=True
                 save_state(state)
-                log_action(f"LOG MARGIN-HOLD engaged: {_mp:.1f}% of wallet used; no new entries until <= 50%")
-            elif state.get("margin_hold") and _mp<=50.0:
+                log_action(f"LOG MARGIN-HOLD engaged: {_mp:.1f}% of wallet used; no new entries until <= 40%")
+            elif state.get("margin_hold") and _mp<=40.0:
                 state["margin_hold"]=False
                 save_state(state)
-                log_action(f"LOG MARGIN-HOLD released: {_mp:.1f}% <= 50%; new entries allowed")
+                log_action(f"LOG MARGIN-HOLD released: {_mp:.1f}% <= 40%; new entries allowed")
         if DRY_RUN or not (state.get("retained_trailing") or state.get("parked_ambiguous")):return
         if not client.configured:raise BybitError("Bybit credentials missing")
         if state.get("parked_ambiguous"):recover_parked_entries(client,state)

@@ -188,7 +188,7 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
         return f"SKIP {key} new_entry: manual protect active for {bk}", None
     if state.get("margin_hold"):
         return (f"SKIP {key} new_entry: margin hold active ({state.get('margin_pct', 0):.1f}% used); "
-                f"entries resume when margin <= 50%", None)
+                f"entries resume when margin <= 40%", None)
 
     roi = source_roi(p)
     if roi is not None and roi >= PROFIT_SKIP_ROI:
@@ -608,15 +608,15 @@ def poll_once() -> None:
             state["margin_pct"] = round(_pct, 2)
             _margin_check(NAME, _wallet, _pos,
                           os.environ.get("WEBHOOK_SHARED_SECRET", ""), log_action)
-            # owner 2026-10-21: no NEW entries while margin >= 70%; entries
-            # resume once margin is back to 50% or below. Existing mirrors keep
+            # owner 2026-10-28: no NEW entries while margin >= 70%; entries
+            # resume once margin is back to 40% or below (owner 2026-10-28; was 50%). Existing mirrors keep
             # running unchanged (size syncs, stops, close-follow all active).
             if not state.get("margin_hold") and _pct >= 70.0:
                 state["margin_hold"] = True
-                log_action(f"LOG MARGIN-HOLD engaged: {_pct:.1f}% of wallet used; no new entries until <= 50%")
-            elif state.get("margin_hold") and _pct <= 50.0:
+                log_action(f"LOG MARGIN-HOLD engaged: {_pct:.1f}% of wallet used; no new entries until <= 40%")
+            elif state.get("margin_hold") and _pct <= 40.0:
                 state["margin_hold"] = False
-                log_action(f"LOG MARGIN-HOLD released: {_pct:.1f}% <= 50%; new entries allowed")
+                log_action(f"LOG MARGIN-HOLD released: {_pct:.1f}% <= 40%; new entries allowed")
     except Exception as _e:
         log_action(f"LOG margin monitor failed ({type(_e).__name__}: {str(_e)[:60]})")
 
