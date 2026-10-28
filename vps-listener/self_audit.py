@@ -138,8 +138,13 @@ def service_active(name):
         return False, 'unknown (%s)' % e
 
 
+def state_name(account):
+    """Engine state/log files drop the 'copy-' prefix (COPY_NAME=bakery)."""
+    return account[5:] if account.startswith('copy-') else account
+
+
 def load_state(name):
-    p = os.path.join(STATE_DIR, '%s_state.json' % name)
+    p = os.path.join(STATE_DIR, '%s_state.json' % state_name(name))
     try:
         return json.load(open(p))
     except Exception:  # noqa: BLE001
@@ -396,7 +401,7 @@ def baseline_count(account, status):
 
 def read_log(account, max_lines=1500):
     """Tail of the account's action log (full file, not the 20-line /status tail)."""
-    path = os.path.join(STATE_DIR, '%s_actions.log' % account)
+    path = os.path.join(STATE_DIR, '%s_actions.log' % state_name(account))
     try:
         with open(path, 'rb') as f:
             f.seek(0, 2)
