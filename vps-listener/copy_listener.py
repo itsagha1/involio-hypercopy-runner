@@ -625,7 +625,11 @@ def poll_once() -> None:
         _stats: Dict[str, Any] = {}
         for _i, _pid in enumerate(PORTFOLIO_IDS):
             _name = PROFILE_NAMES[_i] if _i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
-            _st = source_api.fetch_source_stats(_name, _pid)
+            try:
+                _st = source_api.fetch_source_stats(_name, _pid)
+            except Exception as _pe:
+                log_action(f"LOG source-stats degraded for {_name} ({_pe.__class__.__name__}); stats skipped, poll continues")
+                continue
             if _name in _stats:
                 for _k in ("trades_24h", "closed_24h", "opened_24h", "total_trades",
                            "wins", "losses", "total_pnl", "pnl_24h", "open_now"):
@@ -634,9 +638,11 @@ def poll_once() -> None:
                 _stats[_name] = _st
         state["source_stats"] = _stats
     except Exception as _e:
-        log_action(f"LOG source-stats refresh failed ({type(_e).__name__}: {str(_e)[:80]})")
-        save_state(state)
-        return
+        # Owner 2026-10-28: NON-FATAL. This block used to save+return, which
+        # aborted the ENTIRE poll (no mirroring, no last_poll update) whenever
+        # Involio degraded a stats endpoint - the books themselves were fine.
+        # Stats are dashboard cosmetics; keep stale values and keep polling.
+        log_action(f"LOG source-stats refresh failed ({type(_e).__name__}: {str(_e)[:80]}); continuing with previous stats")
 
     prev = state.get("books")
     positions = book.get("positions", [])

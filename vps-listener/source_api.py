@@ -1,6 +1,6 @@
 """Read-only Involio adapter. All credentials stay in the VPS environment."""
 from datetime import datetime, timezone
-import math, os, requests
+import json, math, os, requests
 PROFILE = 'booobsas'
 PORTFOLIO_ID = '1c4f8dfd-3e4c-4378-b6fd-a0f694c10fd3'
 PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837','oozypath':'2f5cb886-dfa0-457a-976e-4bc9c13ce35e','_k2_':'b34527e7-44e3-4e33-94a0-c2b7d637c6c6'}
@@ -163,6 +163,20 @@ def fetch_dex_book(session, profile=PROFILE, portfolio_id=None, portfolio=None):
             'snapshot_at':datetime.now(timezone.utc).isoformat()}
 
 
+_REMAINING_SIM_CACHE_FILE='/tmp/involio_remaining_sim_cache.json'
+try:
+    with open(_REMAINING_SIM_CACHE_FILE) as _f:
+        _LAST_REMAINING_SIM=json.load(_f)
+except Exception:
+    _LAST_REMAINING_SIM={}
+
+def _save_remaining_cache():
+    try:
+        with open(_REMAINING_SIM_CACHE_FILE,'w') as _f:
+            json.dump(_LAST_REMAINING_SIM,_f)
+    except Exception:
+        pass
+
 def fetch_source_book(profile=PROFILE, portfolio_id=None):
 
     if portfolio_id is None:
@@ -183,19 +197,69 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
         if value.get('success') is not True or value.get('error'):
             raise SourceDataError('Source API failed for '+path)
         return value
-    metadata=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+    def post_retry(path,data,attempts=3):
+        # Owner 2026-10-28: Involio endpoints flap with transient 500s/null pages
+        # during partial outages; a short retry window keeps the engine alive
+        # (the main listener survived 3.5h of flapping purely via retries).
+        last=None
+        for a in range(attempts):
+            try:
+                return post(path,data)
+            except Exception as e:
+                last=e
+                if a<attempts-1: time.sleep(1.5*(a+1))
+        raise last
+    metadata=post_retry('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
     if (metadata.get('portfolio') or {}).get('type') == 'live':
         return fetch_dex_book(session, profile, portfolio_id, metadata.get('portfolio'))
     positions=[]
     for page in range(1,22):
         if page>20: raise SourceDataError('Source pagination exceeded safety bound')
-        value=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':page,'size':50}})
+        value=post_retry('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':page,'size':50}})
         batch=value.get('investmentsTicker')
         if not isinstance(batch,list): raise SourceDataError('Missing open-position page')
         positions.extend(batch)
         if len(batch)<50: break
-    sims=post('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
-    return normalize_source(metadata,positions,sims,profile,portfolio_id)
+    try:
+        sims=post_retry('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
+        if sims.get('success') is True and sims.get('portfolioRemainingSim') is not None:
+            _LAST_REMAINING_SIM[portfolio_id]=float(sims.get('portfolioRemainingSim'))
+            _save_remaining_cache()
+        if sims.get('success') is not True:
+            raise SourceDataError('sims success flag false')
+    except Exception:
+        # DEGRADED MODE (owner 2026-10-28, sims outage): the positions endpoint works
+        # but sims is down. Approximate per-position sim marks locally with the
+        # standard perp formula (entrySim + entrySim*lev*price_return) and reuse
+        # the last known portfolio cash balance. Mirroring stays alive; book is
+        # flagged sims_degraded for engine logging. ROI-skip math is approximate
+        # (ignores sim fees) - acceptable for the 2% entry-skip threshold.
+        remaining=_LAST_REMAINING_SIM.get(portfolio_id)
+        if remaining is None:
+            inv=(metadata.get('portfolio') or {}).get('investableSim')
+            try:
+                inv=float(inv)
+            except Exception:
+                inv=None
+            if inv is None or not math.isfinite(inv) or inv<0:
+                raise SourceDataError('sims unavailable and no cached cash balance; cannot size safely')
+            remaining=max(0.0, inv-sum(float(p.get('entrySim') or 0) for p in positions))
+        approx=[]
+        for p in positions:
+            try:
+                m=float(p.get('entrySim') or 0); lev=float(p.get('leverage') or 1)
+                e=float(p.get('entryPrice') or 0); c=float(p.get('currentPrice') or e)
+                ret=(c-e)/e if e else 0.0
+                if p.get('directionLong') is not True: ret=-ret
+                approx.append({'baseId':str(p.get('baseId')),'entrySim':m,
+                               'lastSim':max(0.0, m + m*lev*ret)})
+            except Exception:
+                raise SourceDataError('sims degraded and position math failed')
+        sims={'success':True,'degraded':True,'investments':approx,
+              'portfolioRemainingSim':remaining}
+    book=normalize_source(metadata,positions,sims,profile,portfolio_id)
+    book['sims_degraded']=bool(sims.get('degraded'))
+    return book
 
 
 def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
