@@ -319,6 +319,10 @@ def check_labels(account, port, status, findings, prev_codes, apply_fixes=True):
                          fixed='manual_remove' if apply_fixes else None)
 
     owned = set(mirror_cs.keys())
+    # retained (source-vanished) positions are still ENGINE-managed: never manual
+    for rk, rv in (status.get('retained_trailing') or status.get('retained') or {}).items():
+        if isinstance(rv, dict) and rv.get('symbol'):
+            owned.add((rv.get('symbol'), side_norm(rv.get('side'))))
     for bk in seen:
         coin, _, sd = str(bk).partition('/')
         owned.add((sym_of(coin), side_norm(sd)))
@@ -379,11 +383,24 @@ def check_mirror_divergence(account, port, status, findings, prev_keys, apply_fi
                          'POST /audit/fix deregister failed: %s' % result.get('error'))
 
 
+def baseline_count(account, status):
+    """Number of baselined (pre-existing, never-mirrored) positions."""
+    bp = status.get('baseline_count')
+    if isinstance(bp, int):
+        return bp
+    st = load_state(account)
+    bl = st.get('baseline')
+    return len(bl) if isinstance(bl, (list, tuple)) else 0
+
+
 def check_missed_mirrors(account, status, findings):
     """C. source holds open positions we cannot account for."""
     src = status.get('source_stats') or {}
     if not src:
         return
+    # baseline entries carry no profile, so they form a shared pool that can
+    # legitimately cover part of the gap (positions opened before we mirrored).
+    baseline_pool = baseline_count(account, status)
     mirrors = mirrors_of(status)
     retained = status.get('retained') or {}
     skip_watch = status.get('skip_watch') or {}
@@ -406,6 +423,15 @@ def check_missed_mirrors(account, status, findings):
         if accounted >= opens:
             continue
         gap = opens - accounted
+        if baseline_pool > 0:
+            covered = min(gap, baseline_pool)
+            baseline_pool -= covered
+            gap -= covered
+            if gap <= 0:
+                findings.add(account, 'source_gap_baselined', 'info',
+                             '%s holds %d open, %d accounted + %d baselined'
+                             % (profile, opens, accounted, covered))
+                continue
         # can the log tail explain the per-poll skips (sub-minimum, conflict, hold)?
         reasons = [l for l in log_tail if profile in l and
                    ('SKIP' in l or 'SKIP-WATCH' in l or 'ERROR' in l)]
@@ -425,12 +451,46 @@ def check_missed_mirrors(account, status, findings):
                             len(mine_s), len(mine_b)))
 
 
+def process_start(unit):
+    """Timestamp the running process started - log lines older than this are
+    history (already-fixed bugs), not live findings."""
+    try:
+        out = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestamp', '--value', unit],
+                             capture_output=True, text=True, timeout=10)
+        txt = out.stdout.strip()
+        if not txt:
+            return None
+        # e.g. "Wed 2026-10-28 15:08:32 UTC"
+        parts = txt.split()
+        for i in range(len(parts) - 1):
+            if len(parts[i]) == 10 and parts[i][4] == '-' and ':' in parts[i + 1]:
+                stamp = '%sT%s' % (parts[i], parts[i + 1])
+                return parse_ts(stamp)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def line_ts(line):
+    """Parse the leading '[2026-10-28 14:37:47 UTC]' stamp of an action log line."""
+    try:
+        if not line.startswith('['):
+            return None
+        return parse_ts(line[1:line.index(']')].replace(' UTC', '+00:00'))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def check_skip_signatures(account, status, findings):
-    """D. known bug shapes in the recent log tail."""
+    """D. known bug shapes in the recent log tail (current process run only)."""
     mirrors = mirrors_of(status)
     mirror_cs = {(m['symbol'], m['side']) for m in mirrors.values()}
+    started = process_start(account)
     for line in (status.get('log_tail') or []):
         line = str(line)
+        ts = line_ts(line)
+        if started and ts and ts < started:
+            continue  # pre-restart history: already fixed
         if 'live position conflict on Bybit for' in line:
             try:
                 sym = line.split('for ')[1].split('/')[0].strip()
