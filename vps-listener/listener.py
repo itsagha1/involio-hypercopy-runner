@@ -1623,7 +1623,7 @@ def _build_fleet_snapshot():
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx+prateek"), (8002, "copy-bakery", "nathanbrown+retrace"),
         (8003, "copy-scalping", "luxora+nicush+leomessi"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
-        (8005, "copy-bluespire", "bluespire+b4451+lagostini"),
+        (8005, "copy-bluespire", "bluespire+b4451+lagostini+dragnix"),
     ]
     for port, name, profile in copies:
         try:
