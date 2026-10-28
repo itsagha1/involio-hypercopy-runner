@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly copy-fleet self-audit
+
+[Timer]
+OnCalendar=*:20
+OnBootSec=8min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

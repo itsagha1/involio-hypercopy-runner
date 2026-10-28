@@ -1,0 +1,7 @@
+[Unit]
+Description=Involio copy-fleet self-audit (owner 2026-10-28)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ubuntu/involio-hypercopy-runner/vps-listener/self_audit.py
