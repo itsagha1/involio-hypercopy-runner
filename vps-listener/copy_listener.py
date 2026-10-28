@@ -30,6 +30,7 @@ import threading
 import hashlib
 import json
 import math
+import hmac
 import os
 import time
 from datetime import datetime, timezone
@@ -43,7 +44,7 @@ try:
 except (ImportError, PermissionError):
     pass
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Header, HTTPException, Body
 from starlette.concurrency import run_in_threadpool
 
 import source_api
@@ -971,6 +972,70 @@ def log_endpoint(n: int = 400):
     return {"ok": True, "code_version": APP_VERSION,
             "lines": [l.strip() for l in log_tail(min(max(n, 1), 2000))]}
 
+
+@app.post("/manual/close")
+def manual_close(body: dict = Body(default=None), x_signature: str = Header(default="")):
+    """Owner one-click close (dashboard 2026-10-28): close a mirrored or retained
+    position at market, reduce-only, and deregister it from the engine.
+    NOTE: load_state/save_state take STATE_LOCK internally (non-reentrant) - do
+    not wrap this handler in the same lock."""
+    secret = os.environ.get("WEBHOOK_SHARED_SECRET", "")
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, secret):
+        raise HTTPException(403, "bad signature")
+    body = body or {}
+    symbol = str(body.get("symbol") or "").strip()
+    side = str(body.get("side") or "").strip()
+    if not symbol or side not in ("long", "short"):
+        return {"ok": False, "error": "symbol and side required"}
+    if DRY_RUN:
+        return {"ok": False, "error": "engine in dry-run"}
+    actions = []
+    state = state_get()
+    client = BybitClient()
+    if not client.configured:
+        return {"ok": False, "error": "Bybit API not configured"}
+    for k in [k for k, r in (state.get("mirrored") or {}).items()
+              if r.get("symbol") == symbol and r.get("side") == side]:
+        info = {"reason": "owner_one_click", "closedAt": datetime.now(timezone.utc).isoformat()}
+        line = close_confirmed_at_market(client, k, state["mirrored"][k], info)
+        log_action(line)
+        actions.append(line)
+        if not line.startswith("ERROR"):
+            state["mirrored"].pop(k, None)
+    for k in [k for k, r in (state.get("retained") or {}).items()
+              if r.get("symbol") == symbol and r.get("side") == side]:
+        r = state["retained"][k]
+        try:
+            live = [lp for lp in client.get_positions(symbol)
+                    if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                    and float(lp.get("size") or 0) > 0]
+            if live:
+                qty = float(live[0]["size"])
+                inst = client.get_instrument(symbol)
+                q = round_qty(min(qty, float(r.get("qty") or qty)), inst)
+                place_order_mode_safe(client, symbol, close_side(side), q,
+                                      position_idx=position_idx(symbol, side), reduce_only=True,
+                                      order_link_id=order_link(k, "manualclose", int(time.time())))
+            try:
+                client.set_sl_tp(symbol, stop_loss=0, take_profit=0,
+                                 position_idx=position_idx(symbol, side))
+            except BybitError:
+                pass
+            del state["retained"][k]
+            line = f"CLOSED {k} owner one-click close (retained position closed at market)"
+            log_action(line)
+            actions.append(line)
+        except BybitError as e:
+            line = f"ERROR {k} owner one-click close: {e}"
+            log_action(line)
+            actions.append(line)
+    save_state(state)
+    if not actions:
+        return {"ok": False, "error": f"no mirrored/retained position found for {symbol} {side}"}
+    ok = not any(a.startswith("ERROR") for a in actions)
+    return {"ok": ok, "actions": actions}
 
 POLL_TASK = None
 

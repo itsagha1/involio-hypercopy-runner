@@ -28,7 +28,7 @@ except (ImportError, PermissionError):
     # systemd already loaded the root-only EnvironmentFile; do not weaken its permissions.
     pass
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException, Body
 from pydantic import BaseModel
 
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
@@ -1717,6 +1717,97 @@ def _main_self_poll_loop():
         time.sleep(60)
 
 threading.Thread(target=_main_self_poll_loop, daemon=True, name="main-self-poll").start()
+
+@app.post("/manual/close")
+def manual_close(body: dict = Body(default=None), x_signature: str = Header(default="")):
+    """Owner one-click close (dashboard 2026-10-28): close a mirrored or retained
+    position at market on the MAIN account, or proxy to a copy subaccount engine
+    (copy accounts are only reachable through this listener's tunnel)."""
+    import urllib.request, urllib.error
+    secret = get_shared_secret()
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, secret):
+        raise HTTPException(403, "bad signature")
+    body = body or {}
+    account = str(body.get("account") or "main")
+    if account != "main":
+        ports = {"copy-mainport": 8001, "copy-bakery": 8002, "copy-scalping": 8003,
+                 "copy-kings": 8004, "copy-bluespire": 8005}
+        port = ports.get(account)
+        if not port:
+            return {"ok": False, "error": "unknown account"}
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/manual/close",
+                                     data=json.dumps({"symbol": body.get("symbol"), "side": body.get("side")}).encode(),
+                                     headers={"X-Signature": secret, "Content-Type": "application/json"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "error": f"copy engine HTTP {e.code}: {e.read().decode()[:150]}"}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    symbol = str(body.get("symbol") or "").strip()
+    side = str(body.get("side") or "").strip()
+    if not symbol or side not in ("long", "short"):
+        return {"ok": False, "error": "symbol and side required"}
+    if DRY_RUN:
+        return {"ok": False, "error": "engine in dry-run"}
+    actions = []
+    with STATE_LOCK:
+        state = load_state()
+        client = BybitClient()
+        if not client.configured:
+            return {"ok": False, "error": "Bybit API not configured"}
+        for k in [k for k, r in (state.get("mirrored") or {}).items()
+                  if r.get("symbol") == symbol and r.get("side") == side]:
+            rec = state["mirrored"][k]
+            idx = position_idx(symbol, side)
+            try:
+                live = [lp for lp in client.get_positions(symbol)
+                        if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                        and float(lp.get("size") or 0) > 0]
+                qty = float(live[0]["size"]) if live else float(rec.get("qty") or 0)
+                client.place_order(symbol, close_side(side), qty, position_idx=idx,
+                                   reduce_only=True, order_link_id=order_link(k, "manualclose", int(time.time())))
+                del state["mirrored"][k]
+                line = f"CLOSED {k} owner one-click close (mirrored position closed at market)"
+                log_action(line)
+                actions.append(line)
+            except BybitError as e:
+                line = f"ERROR {k} owner one-click close: {e}"
+                log_action(line)
+                actions.append(line)
+        for k in [k for k, r in (state.get("retained_trailing") or {}).items()
+                  if (r.get("symbol") or "") == symbol and (r.get("side") or "") == side]:
+            r = state["retained_trailing"][k]
+            try:
+                live = [lp for lp in client.get_positions(symbol)
+                        if lp.get("side") == ("Buy" if side == "long" else "Sell")
+                        and float(lp.get("size") or 0) > 0]
+                if live:
+                    qty = float(live[0]["size"])
+                    client.place_order(symbol, close_side(side), qty, position_idx=position_idx(symbol, side),
+                                       reduce_only=True, order_link_id=order_link(k, "manualclose", int(time.time())))
+                try:
+                    client.set_sl_tp(symbol, stop_loss=0, take_profit=0,
+                                     position_idx=position_idx(symbol, side))
+                except BybitError:
+                    pass
+                del state["retained_trailing"][k]
+                line = f"CLOSED {k} owner one-click close (retained position closed at market)"
+                log_action(line)
+                actions.append(line)
+            except BybitError as e:
+                line = f"ERROR {k} owner one-click close: {e}"
+                log_action(line)
+                actions.append(line)
+        save_state(state)
+    if not actions:
+        return {"ok": False, "error": f"no mirrored/retained position found for {symbol} {side}"}
+    ok = not any(a.startswith("ERROR") for a in actions)
+    return {"ok": ok, "actions": actions}
 
 _FLEET_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 
