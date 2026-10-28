@@ -48,6 +48,7 @@ from fastapi import FastAPI, Request, Header, HTTPException, Body
 from starlette.concurrency import run_in_threadpool
 
 import source_api
+from source_api import SourceDataError
 import bybit_api
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
@@ -510,7 +511,7 @@ def mirror_stats_payload():
         return _MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
 
 
-def fetch_merged_books(profile: str) -> Dict[str, Any]:
+def fetch_merged_books(profile: str) -> Any:
     """Fetch and merge the books of every portfolio bound to this subaccount.
     COPY_PORTFOLIO_ID may be a comma-separated list (owner 2026-10-13: luxora
     Treasury + Odyssey on one subaccount). Source investment ids are UUIDs and
@@ -519,17 +520,26 @@ def fetch_merged_books(profile: str) -> Dict[str, Any]:
     positions: List[Dict[str, Any]] = []
     equity = 0.0
     remaining = 0.0
+    degraded: List[str] = []
     for i, pid in enumerate(PORTFOLIO_IDS):
         name = PROFILE_NAMES[i] if i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
-        book = source_api.fetch_source_book(name, pid)
+        try:
+            book = source_api.fetch_source_book(name, pid)
+        except Exception as e:
+            degraded.append(pid)
+            log_action(f"LOG {name} book degraded ({pid[:8]}): {type(e).__name__}: {str(e)[:90]}; "
+                       f"portfolio frozen this poll, other portfolios continue")
+            continue
         for p in book.get("positions", []):
             p["portfolio"] = pid[:8]
             p["profile"] = name
             positions.append(p)
         equity += float(book.get("source_equity") or 0)
         remaining += float(book.get("remaining_sim") or 0)
+    if degraded and len(degraded) == len(PORTFOLIO_IDS):
+        raise SourceDataError("all bound portfolios degraded")
     return {"positions": positions, "source_equity": equity,
-            "remaining_sim": remaining}
+            "remaining_sim": remaining}, degraded
 
 
 # ---------------------------------------------------------------- poll cycle
@@ -581,7 +591,7 @@ def poll_once() -> None:
     client = BybitClient()
     errors = 0
     try:
-        book = fetch_merged_books(PROFILE)
+        book, degraded_pids = fetch_merged_books(PROFILE)
     except Exception as e:
         state["errors_last_run"] = state.get("errors_last_run", 0) + 1
         log_action(f"ERROR source fetch: {type(e).__name__}: {e}; retry next poll")
@@ -706,8 +716,11 @@ def poll_once() -> None:
         if sid in by_id:
             missing.pop(sid, None)
     if not (DRY_RUN or not client.configured):
+        degraded_names = {PROFILE_NAMES[i] if i < len(PROFILE_NAMES) else PROFILE_NAMES[-1]
+                          for i, pid in enumerate(PORTFOLIO_IDS) if pid in (degraded_pids or [])}
         absent = [rk for rk in list(state["mirrored"].keys())
-                  if rk.split("|")[-1] not in by_id]
+                  if rk.split("|")[-1] not in by_id
+                  and (state["mirrored"][rk].get("profile") or "") not in degraded_names]
         closed_map = {}
         closed_map_ok = True
         if absent:
