@@ -204,6 +204,19 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
             raise
         for lp in live_positions:
             if float(lp.get("size") or 0) > 0:
+                # Owner 2026-10-28: the live position may be OUR OWN mirror from a
+                # different source (e.g. lazylegendx BTC/long blocked by the
+                # prateek BTC/long mirror). That is not an owner-managed position:
+                # never stamp the manual list for it, or the dashboard mislabels a
+                # live mirror as owner-managed and all future entries for this
+                # coin/side are blocked fleet-wide. Only a position attributable to
+                # no mirror at all is genuinely manual.
+                covering=None
+                for mk, mv in (state.get("mirrored") or {}).items():
+                    if mk!=key and mv.get("symbol")==symbol and str(mv.get("side")).lower()==side:
+                        covering=mk; break
+                if covering:
+                    return f"SKIP {key} new_entry: {symbol}/{side} already mirrored by {covering} (one position per symbol/side)", None
                 state["manual"].append(bk) if bk not in state["manual"] else None
                 return f"SKIP {key} new_entry: live position conflict on Bybit for {symbol}/{side}", None
 
