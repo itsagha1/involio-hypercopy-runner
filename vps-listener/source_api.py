@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import json, math, os, requests
 PROFILE = 'booobsas'
 PORTFOLIO_ID = '1c4f8dfd-3e4c-4378-b6fd-a0f694c10fd3'
-PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837','oozypath':'2f5cb886-dfa0-457a-976e-4bc9c13ce35e','_k2_':'b34527e7-44e3-4e33-94a0-c2b7d637c6c6'}
+PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837','oozypath':'2f5cb886-dfa0-457a-976e-4bc9c13ce35e','johndrockefeller':'dae63459-fbe6-4875-8e07-e60dcf9776c4','_k2_':'b34527e7-44e3-4e33-94a0-c2b7d637c6c6'}
 # Owner 2026-10-28: Involio migrated their API to api.invoapp.com (the web app
 # bundle calls it); the legacy api.involio.com is unreachable from datacenter
 # networks. Env-overridable for any future migration.

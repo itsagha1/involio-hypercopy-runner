@@ -43,7 +43,7 @@ LOG_FILE = os.environ.get("LOG_FILE", "actions.log")
 STATE_VERSION = 3
 LISTENER_VERSION = "v3.7.4"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
-AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath", "_k2_"}
+AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath", "_k2_", "johndrockefeller"}
 
 PROFIT_SKIP_ROI = 0.02            # owner rule 2026-10-13: skip new trades already >= +2% source ROI on margin, with auto re-entry watch below 2%
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
@@ -1601,7 +1601,7 @@ def _build_fleet_snapshot():
         main = {"ok": False, "status": "error", "error": str(e)[:200]}
     _ms = main_mirror_stats(main.get("mirrored", {}))
     accounts.append({
-        "id": "main", "name": "Main (booobsas+akira+oozypath)", "port": 8000,
+        "id": "main", "name": "Main (booobsas+akira+oozypath+johndrockefeller)", "port": 8000,
         "version": main.get("code_version"), "ok": main.get("ok"),
         "errors_last_run": main.get("errors_last_run", 0),
         "wallet_balance": main.get("wallet_balance"),
