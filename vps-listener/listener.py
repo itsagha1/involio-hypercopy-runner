@@ -1622,7 +1622,7 @@ def _build_fleet_snapshot():
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx+prateek"), (8002, "copy-bakery", "nathanbrown+retrace+chatgptrades"),
-        (8003, "copy-scalping", "luxora+nicush+leomessi"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
+        (8003, "copy-scalping", "luxora+nicush+leomessi+azure11"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
         (8005, "copy-bluespire", "bluespire+horse+lagostini+dragnix"),
     ]
     for port, name, profile in copies:
