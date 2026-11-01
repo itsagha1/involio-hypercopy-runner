@@ -358,7 +358,7 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
         rec["desired_source_qty"] = curr_sq
         return action
     except BybitError as e:
-        return f"ERROR {key} sync_size: {e}"
+        return f"{'SKIP' if 'too small' in str(e) else 'ERROR'} {key} sync_size: {e}"
 
 
 def sync_sltp(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Optional[str]:

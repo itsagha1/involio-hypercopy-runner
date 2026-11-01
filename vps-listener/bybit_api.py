@@ -25,6 +25,14 @@ import requests
 
 RECV_WINDOW = "15000"
 
+# --- owner 2026-11-02: clock-skew guard ---
+# The VM clock drifts up to ~20s behind Bybit between NTP steps; signed calls
+# then fail retCode=10002 (recv_window). We track the live offset from
+# /v5/market/time (public), sign with corrected timestamps, and on a 10002
+# re-sync immediately and retry once.
+_CLOCK = {"offset_ms": 0, "ts": 0.0}
+_CLOCK_TTL_S = 600.0
+
 
 class BybitError(Exception):
     pass
@@ -82,6 +90,26 @@ class BybitClient:
             self.rsa_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
         ).decode()
 
+    def _server_time_ms(self):
+        try:
+            r = self.session.get(self.base + "/v5/market/time", timeout=10)
+            return int(int(r.json()["result"]["timeNano"]) / 1e6)
+        except Exception:
+            return None
+
+    def sync_clock(self, force=False):
+        now = time.time()
+        if not force and now - _CLOCK["ts"] < _CLOCK_TTL_S:
+            return _CLOCK["offset_ms"]
+        srv = self._server_time_ms()
+        if srv is None:
+            return _CLOCK["offset_ms"]
+        _CLOCK["offset_ms"] = srv - int(now * 1000)
+        _CLOCK["ts"] = now
+        return _CLOCK["offset_ms"]
+    def _now_ms(self):
+        return int(time.time() * 1000 + self.sync_clock())
+
     def _check(self, data: dict, path: str) -> dict:
         if data.get("retCode") != 0:
             raise BybitError(f"{path} -> retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
@@ -91,7 +119,7 @@ class BybitClient:
         if not self.configured:
             raise BybitError("Bybit keys not configured in .env")
         for attempt in range(3):
-            ts = str(int(time.time() * 1000))
+            ts = str(self._now_ms())
             qs = urllib.parse.urlencode(params)
             headers = {
                 "X-BAPI-API-KEY": self.key,
@@ -102,7 +130,10 @@ class BybitClient:
             try:
                 r=self.session.get(self.base+path+"?"+qs,headers=headers,timeout=25)
                 r.raise_for_status()
-                return self._check(r.json(),path)
+                data = r.json()
+                if data.get("retCode") == 10002 and attempt < 2:
+                    self.sync_clock(force=True); time.sleep(1); continue
+                return self._check(data,path)
             except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
                 if attempt < 2:
                     self._rotate_proxy()
@@ -115,7 +146,7 @@ class BybitClient:
         if not self.configured:
             raise BybitError("Bybit keys not configured in .env")
         for attempt in range(3):
-            ts = str(int(time.time() * 1000))
+            ts = str(self._now_ms())
             raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
             headers = {
                 "X-BAPI-API-KEY": self.key,
@@ -126,7 +157,10 @@ class BybitClient:
             try:
                 r=self.session.post(self.base+path,data=raw.encode(),headers=headers,timeout=25)
                 r.raise_for_status()
-                return self._check(r.json(),path)
+                data = r.json()
+                if data.get("retCode") == 10002 and attempt < 2:
+                    self.sync_clock(force=True); time.sleep(1); continue
+                return self._check(data,path)
             except (requests.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
                 if attempt < 2:
                     self._rotate_proxy()
