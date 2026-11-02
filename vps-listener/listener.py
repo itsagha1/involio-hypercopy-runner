@@ -496,6 +496,35 @@ def sanitize_stale_state(state: Dict[str, Any]) -> List[str]:
     return logs
 
 
+def next_open_link(client, key, symbol, qty, state):
+    """Owner 2026-11-02 (bug: _k2_|ENA/long used link id BC30d6a4.. twice, four days
+    apart - the retry collided with the old fulfilled order and raised 'Linked
+    order fill not confirmed'). OPEN link ids must be unique per entry episode,
+    but STABLE within one attempt so a crash between place and register still
+    recovers idempotently. Rule: keep the current id only when it points at a
+    fresh (<=10 min) order of exactly this qty that Filled - i.e. our own
+    in-flight attempt - otherwise bump the persisted generation."""
+    gens = state.setdefault("open_gens", {})
+    gen = int(gens.get(key) or 0)
+    link = order_link(key, "open", gen)
+    try:
+        o = client.get_linked_order(symbol, link)
+    except Exception:
+        o = None
+    if o is not None:
+        try:
+            _ct = int(o.get("createdTime") or 0) / 1000.0
+            _fresh = _ct > 0 and (time.time() - _ct) <= 600
+        except Exception:
+            _fresh = False
+        _same = abs(float(o.get("cumExecQty") or 0) - qty) <= max(1e-9, qty * 1e-8)
+        if not (_fresh and _same and o.get("orderStatus") == "Filled"):
+            gen += 1
+            link = order_link(key, "open", gen)
+    gens[key] = gen
+    return link
+
+
 def order_link(key,operation,generation=0):
     return "BC"+hashlib.sha256((key+"|"+operation+"|"+str(generation)).encode()).hexdigest()[:32]
 
@@ -617,11 +646,12 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
             return f"SKIP {key} new_entry: notional after quantization ({notional_after_quant:.2f} USDT) below minimum ({MIN_NOTIONAL:.0f} USDT)", None
 
         client.set_leverage(symbol, lev)
-        state.setdefault("parked_ambiguous", {})[key] = {"reason":"order submission in progress","symbol":symbol,"order_link_id":order_link(key,"open"),"position":p,"requested_qty":qty,"leverage":lev}
+        open_link = next_open_link(client, key, symbol, qty, state)
+        state.setdefault("parked_ambiguous", {})[key] = {"reason":"order submission in progress","symbol":symbol,"order_link_id":open_link,"position":p,"requested_qty":qty,"leverage":lev}
         save_state(state)
         requested_qty=qty
         fill=client.place_order(symbol, bybit_side(side), qty,
-                           position_idx=position_idx(symbol, side), order_link_id=order_link(key,"open"))
+                           position_idx=position_idx(symbol, side), order_link_id=open_link)
         qty=float(fill.get("filled_qty") or qty)
         price=float(fill.get("filled_avg_price") or price)
         if fill.get("partial_fill"):log_action(f"ERROR {key}: market order partially filled; stops applied to actual fill, remainder queued")

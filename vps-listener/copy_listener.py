@@ -144,6 +144,32 @@ def bybit_key(p: Dict[str, Any]) -> str:
     return f"{p['ticker']}/{p['side']}"
 
 
+def next_open_link(client, key: str, symbol: str, qty: float, state: dict) -> str:
+    """Owner 2026-11-02 (bug: _k2_|ENA/long reused link BC30d6a4.. across entry
+    episodes 4 days apart). OPEN ids must be unique per entry episode but stable
+    within one attempt (crash between place and register must recover
+    idempotently). Keep the id only if it points at OUR in-flight fill."""
+    gens = state.setdefault("open_gens", {})
+    gen = int(gens.get(key) or 0)
+    link = order_link(key, "open", gen)
+    try:
+        o = client.get_linked_order(symbol, link)
+    except Exception:
+        o = None
+    if o is not None:
+        try:
+            _ct = int(o.get("createdTime") or 0) / 1000.0
+            _fresh = _ct > 0 and (time.time() - _ct) <= 600
+        except Exception:
+            _fresh = False
+        _same = abs(float(o.get("cumExecQty") or 0) - qty) <= max(1e-9, qty * 1e-8)
+        if not (_fresh and _same and o.get("orderStatus") == "Filled"):
+            gen += 1
+            link = order_link(key, "open", gen)
+    gens[key] = gen
+    return link
+
+
 def order_link(key: str, operation: str, generation: int = 0) -> str:
     return "CC" + hashlib.sha256((key + "|" + operation + "|" + str(generation)).encode()).hexdigest()[:32]
 
@@ -274,9 +300,10 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
 
         client.set_leverage(symbol, lev)
         requested_qty = qty
+        open_link = next_open_link(client, key, symbol, qty, state)
         fill = place_order_mode_safe(client, symbol, bybit_side(side), qty,
                                   position_idx=position_idx(symbol, side),
-                                  order_link_id=order_link(key, "open"))
+                                  order_link_id=open_link)
         qty = float(fill.get("filled_qty") or qty)
         price = float(fill.get("filled_avg_price") or price)
 
@@ -1052,6 +1079,40 @@ def status():
 def log_endpoint(n: int = 400):
     return {"ok": True, "code_version": APP_VERSION,
             "lines": [l.strip() for l in log_tail(min(max(n, 1), 2000))]}
+
+
+@app.post("/audit/fix")
+def audit_fix(body: dict = Body(default=None), x_signature: str = Header(default="")):
+    """Self-audit repair endpoint (missing since the audit engine landed 2026-10-28;
+    the hourly audit POSTs conservative STATE BOOKKEEPING fixes here). Payload from
+    self_audit.py: {"manual_remove": [bookkey...], "manual_add": [bookkey...],
+    "deregister": [mirror key...]}. No trading decisions - only labels/registration
+    so state matches the exchange. Deregistered mirrors reopen cleanly on the next
+    poll if the source still holds the trade."""
+    secret = os.environ.get("WEBHOOK_SHARED_SECRET", "")
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature, secret):
+        raise HTTPException(403, "bad signature")
+    body = body or {}
+    state = state_get()
+    applied = []
+    for bk in body.get("manual_remove") or []:
+        if bk in (state.get("manual") or []):
+            state["manual"].remove(bk)
+            applied.append("manual_remove:" + str(bk))
+    for bk in body.get("manual_add") or []:
+        if bk not in (state.get("manual") or []):
+            state.setdefault("manual", []).append(bk)
+            applied.append("manual_add:" + str(bk))
+    for key in body.get("deregister") or []:
+        if key in (state.get("mirrored") or {}):
+            state["mirrored"].pop(key, None)
+            applied.append("deregister:" + str(key))
+    if applied:
+        log_action("AUDIT-FIX state repair applied: " + ", ".join(applied))
+        save_state(state)
+    return {"ok": True, "applied": applied}
 
 
 @app.post("/manual/close")

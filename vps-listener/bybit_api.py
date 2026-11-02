@@ -321,6 +321,12 @@ class BybitClient:
             if not order_link_id:raise
             existing=self.get_linked_order(symbol,order_link_id)
             if not existing:raise e
+            # owner 2026-11-02 (ENA BC30d6a4 bug class): never adopt a linked order
+            # from an OLD entry episode as this attempt's fill - a duplicate-id
+            # collision must fail loudly, not register a phantom position.
+            _ct=int(existing.get("createdTime") or 0)/1000.0
+            if _ct>0 and time.time()-_ct>600:
+                raise BybitError("Linked order id collision with a stale fill (age %.0fs); refusing to reuse: %s"%(time.time()-_ct,order_link_id))
             result={"orderId":existing.get("orderId"),"recovered":True}
         if order_link_id:
             for attempt in range(3):
