@@ -599,6 +599,43 @@ def close_confirmed_at_market(client: BybitClient, rec_key: str,
         return f"ERROR {key} confirmed-close: {e} - will retry next poll"
 
 
+def reconcile_flat_mirrors(client, state):
+    """Owner 2026-11-02: a mirror can close ON THE EXCHANGE (TP/SL/liquidation)
+    while the source still holds the trade; nothing deregistered it, so state and
+    the dashboard drifted from reality. Absence must persist 2 polls; the source
+    trade is then entry-blocked so it is never back-filled."""
+    live = set()
+    for p in client.get_positions():
+        if float(p.get("size") or 0) <= 0:
+            continue
+        sd = str(p.get("side") or "").lower()
+        live.add((p.get("symbol"), "long" if sd in ("buy", "long") else "short"))
+    misses = state.setdefault("flat_misses", {})
+    out = []
+    now = datetime.now(timezone.utc)
+    for key, rec in list(state.get("mirrored", {}).items()):
+        sym = rec.get("symbol")
+        sd = str(rec.get("side") or "").lower()
+        if (sym, sd) in live:
+            misses.pop(key, None)
+            continue
+        opened = rec.get("opened_at")
+        try:
+            if opened and (now - datetime.fromisoformat(opened)).total_seconds() < 600:
+                continue
+        except Exception:
+            pass
+        misses[key] = int(misses.get(key) or 0) + 1
+        if misses[key] < 2:
+            continue
+        state["mirrored"].pop(key, None)
+        misses.pop(key, None)
+        blocks = state.setdefault("entry_blocks", {})
+        blocks[key] = f"LOG {key}: exchange-side close; entry blocked (no backfill)"
+        out.append(f"CLOSED {key}: absent from exchange 2 polls (TP/SL/liq closed it while the source still held the trade); deregistered + entry-blocked")
+    return chr(10).join(out)
+
+
 def poll_once() -> None:
     state = state_get()
     client = BybitClient()
@@ -687,6 +724,15 @@ def poll_once() -> None:
         state["errors_last_run"] = state.get("errors_last_run", 0) + 1
         save_state(state)
         return
+
+    # --- owner 2026-11-02: reconcile mirrors whose position closed on the exchange ---
+    try:
+        _rec_msg = reconcile_flat_mirrors(client, state)
+        for _l in (_rec_msg or '').splitlines():
+            if _l.strip():
+                log_action(_l)
+    except Exception as _e:
+        log_action(f"LOG reconcile skipped ({type(_e).__name__}: {str(_e)[:80]})")
 
     # --- new source trades ---
     for sid, p in by_id.items():
@@ -987,6 +1033,9 @@ def status():
             "portfolio_id": PORTFOLIO_ID, "dry_run": DRY_RUN, "armed": state.get("armed"),
             "mirror_stats": _ms, "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
             "margin_pct": state.get("margin_pct"), "margin_hold": state.get("margin_hold", False),
+            # owner 2026-11-02: net capital in = equity - realised PnL (estimate; exact
+            # transfer sums need Bybit asset-transfer permission which the keys lack).
+            "invested_usd": round(float(wallet or 0) - float((_ms or {}).get("cumulative_pnl") or 0), 2),
             "last_poll": state.get("last_poll"), "errors_last_run": state.get("errors_last_run"),
             "wallet": wallet, "bybit": bybit,
             "baseline_count": len(state.get("baseline", [])),

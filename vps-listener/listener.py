@@ -1619,6 +1619,10 @@ def _build_fleet_snapshot():
         "source_stats": fleet_source_stats(),
         "mirror_stats": _ms,
         "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
+        # owner 2026-11-02: net capital in = equity - realised PnL (estimate).
+        "invested_usd": round(float(main.get("wallet_balance") or main.get("available_balance")
+                                     or (main.get("bybit") or {}).get("balance") or 0)
+                                - float((_ms or {}).get("cumulative_pnl") or 0), 2),
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx+prateek"), (8002, "copy-bakery", "nathanbrown+retrace+chatgptrades"),
@@ -1656,6 +1660,7 @@ def _build_fleet_snapshot():
                 "source_stats": (d.get("source_stats") or {}),
                 "mirror_stats": (d.get("mirror_stats") or {}),
                 "cumulative_pnl": d.get("cumulative_pnl"),
+                "invested_usd": d.get("invested_usd"),
             })
         except Exception as e:
             # Owner 2026-10-27: a copy /status fetch can exceed the timeout while

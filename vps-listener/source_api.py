@@ -71,6 +71,45 @@ def positive(value, name):
         raise SourceDataError('Nonpositive '+name)
     return value
 
+_OWNER_CACHE_FILE = '/var/lib/hypercopy-copy/source_owners.json'
+
+
+def _owner_cache():
+    try:
+        with open(_OWNER_CACHE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _remember_owner(portfolio_id, owner_id, username):
+    try:
+        cache = _owner_cache()
+        cache[portfolio_id] = {'owner_id': owner_id, 'username': username}
+        with open(_OWNER_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=0)
+    except Exception:
+        pass
+
+
+def check_owner(profile, portfolio_id, portfolio):
+    """Owner 2026-11-02: a source renamed the account (nathanbrown -> thebakerr)
+    and the username check silently killed the whole book. Validate on the
+    stable owner USER ID once known for this portfolio id; learn new usernames."""
+    allowed = {x.strip() for x in str(profile).split(',') if x.strip()}
+    own = portfolio.get('owner') or {}
+    uname = own.get('username')
+    oid = own.get('id')
+    if uname in allowed:
+        _remember_owner(portfolio_id, oid, uname)
+        return
+    rec = _owner_cache().get(portfolio_id) or {}
+    if oid and rec.get('owner_id') == oid:
+        _remember_owner(portfolio_id, oid, uname)
+        return
+    raise SourceDataError('Wrong source owner')
+
+
 def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None):
     # owner 2026-10-16: profile may be comma-separated (multi-owner subaccount,
     # e.g. bluespire,b4451). Every name must be registered; the portfolio's
@@ -85,8 +124,7 @@ def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=No
     portfolio = meta.get('portfolio') or {}
     if meta.get('success') is not True or portfolio.get('id') != portfolio_id:
         raise SourceDataError('Wrong or incomplete source portfolio')
-    if (portfolio.get('owner') or {}).get('username') not in allowed:
-        raise SourceDataError('Wrong source owner')
+    check_owner(profile, portfolio_id, portfolio)
     if sims.get('success') is not True or not isinstance(sims.get('investments'), list):
         raise SourceDataError('Incomplete source sim data')
     expected = int(portfolio.get('openPositions', -1))
@@ -155,8 +193,7 @@ def fetch_dex_book(session, profile=PROFILE, portfolio_id=None, portfolio=None):
         if name not in PROFILES: raise SourceDataError('Unauthorized source profile')
     if portfolio is None or portfolio.get('id') != portfolio_id:
         raise SourceDataError('Wrong or incomplete source portfolio')
-    if (portfolio.get('owner') or {}).get('username') not in allowed:
-        raise SourceDataError('Wrong source owner')
+    check_owner(profile, portfolio_id, portfolio)
     def get(path, params=None):
         response=session.get(BASE+path, params=params or {}, timeout=25)
         response.raise_for_status()
