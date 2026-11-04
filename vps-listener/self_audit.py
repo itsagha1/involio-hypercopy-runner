@@ -62,6 +62,7 @@ COPY_ACCOUNTS = [
     (8003, 'copy-scalping'),
     (8004, 'copy-kings'),
     (8005, 'copy-bluespire'),
+    (8006, 'copy-hypercopy'),
 ]
 
 ACCOUNT_SUMMARY = {}

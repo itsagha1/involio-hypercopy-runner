@@ -1650,14 +1650,17 @@ def _build_fleet_snapshot():
         "mirror_stats": _ms,
         "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
         # owner 2026-11-02: net capital in = equity - realised PnL (estimate).
-        "invested_usd": round(float(main.get("wallet_balance") or main.get("available_balance")
-                                     or (main.get("bybit") or {}).get("balance") or 0)
-                                - float((_ms or {}).get("cumulative_pnl") or 0), 2),
+        "invested_usd": (round(float(main.get("wallet_balance") or main.get("available_balance")
+                                     or (main.get("bybit") or {}).get("balance"))
+                                - float((_ms or {}).get("cumulative_pnl") or 0), 2)
+                          if (main.get("wallet_balance") or main.get("available_balance")
+                              or (main.get("bybit") or {}).get("balance")) else None),
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx+prateek"), (8002, "copy-bakery", "nathanbrown+retrace+chatgptrades"),
         (8003, "copy-scalping", "luxora+nicush+leomessi+azure11"), (8004, "copy-kings", "sid+rareone+ocean+pookiesprofits"),
         (8005, "copy-bluespire", "bluespire+horse+lagostini+dragnix"),
+        (8006, "copy-hypercopy", "henderson_14+_k2_+akira+azure11+nathanbrown"),
     ]
     for port, name, profile in copies:
         try:
