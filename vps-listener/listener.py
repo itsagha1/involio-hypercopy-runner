@@ -1631,11 +1631,12 @@ def _build_fleet_snapshot():
         main = {"ok": False, "status": "error", "error": str(e)[:200]}
     _ms = main_mirror_stats(main.get("mirrored", {}))
     accounts.append({
-        "id": "main", "name": "Main (booobsas+akira+oozypath+johndrockefeller)", "port": 8000,
+        "id": "main", "name": ACCOUNT_LABELS["main"], "account_name": ACCOUNT_LABELS["main"], "port": 8000,
         "version": main.get("code_version"), "ok": main.get("ok"),
         "errors_last_run": main.get("errors_last_run", 0),
-        "wallet_balance": main.get("wallet_balance"),
-        "available_balance": main.get("available_balance"),
+        # owner 2026-11-07: fall back to the bybit snapshot so main never shows a blank wallet.
+        "wallet_balance": (main.get("wallet_balance") or (main.get("bybit") or {}).get("balance")),
+        "available_balance": (main.get("available_balance") or (main.get("bybit") or {}).get("available")),
         "mirrored": main.get("mirrored", {}), "retained": main.get("retained", []),
         "manual": main.get("manual", []),
         "skip_watch_count": len(main.get("skip_watch", {}) or {}) if isinstance(main.get("skip_watch"), dict) else 0,
@@ -1675,7 +1676,7 @@ def _build_fleet_snapshot():
             if not isinstance(mirrored, dict):
                 mirrored = {}
             accounts.append({
-                "id": name, "name": "%s (%s)" % (name, profile), "port": port,
+                "id": name, "name": ACCOUNT_LABELS.get(name, name), "account_name": ACCOUNT_LABELS.get(name, name), "sources": profile, "port": port,
                 "version": d.get("code_version"), "ok": True,
                 "errors_last_run": d.get("errors_last_run", 0),
                 "wallet_balance": d.get("wallet"),
@@ -1863,6 +1864,17 @@ def _fleet_warm_loop():
         time.sleep(60)
 
 threading.Thread(target=_fleet_warm_loop, daemon=True, name="fleet-warm").start()
+
+ACCOUNT_LABELS = {
+    "main": "AI Main account (BYBIT_MAIN)",
+    "copy-mainport": "Sub account 01 (MAINPORT)",
+    "copy-bakery": "Sub account 02 (BAKERY)",
+    "copy-scalping": "Sub account 03 (SCALPING)",
+    "copy-kings": "Sub account 04 (KINGS)",
+    "copy-bluespire": "Sub account 05 (BLUESPIIRE)",
+    "copy-hypercopy": "hypercopy",
+}
+
 
 @app.get("/status/all")
 def status_all(x_signature: str = Header(default="")):
