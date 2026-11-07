@@ -1617,6 +1617,25 @@ def main_mirror_stats(mirrored):
 
 _LAST_GOOD_ACCOUNTS: Dict[str, Any] = {}
 
+def _invested_exact():
+    """Owner rule 2026-11-08: invested = real transfers in minus transfers out.
+    Never derived from wallet minus PnL (that drifts with every trade).
+    Source of truth: invest_sync.py -> /var/lib/hypercopy-copy/invest_exact.json."""
+    try:
+        with open('/var/lib/hypercopy-copy/invest_exact.json') as f:
+            accts = (json.load(f) or {}).get('accounts') or {}
+    except Exception:
+        return {}
+    out = {}
+    for k, v in accts.items():
+        fid = 'main' if k == 'main' else 'copy-' + str(k)
+        try:
+            out[fid] = round(float(v.get('invested') or 0), 2)
+        except Exception:
+            pass
+    return out
+
+
 def _build_fleet_snapshot():
     """Owner fleet overview (2026-10-16): combined live status of the main mirror
     account (this listener) and every dedicated copy subaccount listener
@@ -1692,7 +1711,9 @@ def _build_fleet_snapshot():
                 "source_stats": (d.get("source_stats") or {}),
                 "mirror_stats": (d.get("mirror_stats") or {}),
                 "cumulative_pnl": d.get("cumulative_pnl"),
-                "invested_usd": d.get("invested_usd"),
+                "invested_usd": (_invested_exact().get("copy-" + str(name))
+                                 if _invested_exact().get("copy-" + str(name)) is not None
+                                 else d.get("invested_usd")),
             })
         except Exception as e:
             # Owner 2026-10-27: a copy /status fetch can exceed the timeout while
