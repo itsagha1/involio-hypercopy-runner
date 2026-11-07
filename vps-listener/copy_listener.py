@@ -54,6 +54,20 @@ from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
                        coin_to_symbol, position_idx, round_qty, symbol_to_coin)
 
 APP_VERSION = "c1.0.9"
+
+def _exact_invested(name):
+    """Owner rule 2026-11-08: invested = real transfers in minus transfers out.
+    NEVER derived from wallet minus PnL (that drifts with every trade).
+    Source of truth: invest_sync.py -> /var/lib/hypercopy-copy/invest_exact.json."""
+    try:
+        with open('/var/lib/hypercopy-copy/invest_exact.json') as f:
+            accts = (json.load(f) or {}).get('accounts') or {}
+        v = accts.get(name)
+        return round(float(v['invested']), 2) if v else None
+    except Exception:
+        return None
+
+
 PROFILE = os.environ.get("COPY_PROFILE", "")
 PROFILE_NAMES = [x.strip() for x in PROFILE.split(",") if x.strip()]
 PORTFOLIO_ID = os.environ.get("COPY_PORTFOLIO_ID", "")
@@ -1100,7 +1114,7 @@ def status():
             "margin_pct": state.get("margin_pct"), "margin_hold": state.get("margin_hold", False),
             # owner 2026-11-02: net capital in = equity - realised PnL (estimate; exact
             # transfer sums need Bybit asset-transfer permission which the keys lack).
-            "invested_usd": round(float(wallet or 0) - float((_ms or {}).get("cumulative_pnl") or 0), 2),
+            "invested_usd": (_exact_invested(NAME) if _exact_invested(NAME) is not None else round(float(wallet or 0) - float((_ms or {}).get("cumulative_pnl") or 0), 2)),
             "last_poll": state.get("last_poll"), "errors_last_run": state.get("errors_last_run"),
             "wallet": wallet, "bybit": bybit,
             "baseline_count": len(state.get("baseline", [])),
