@@ -35,6 +35,11 @@ ENVS = {
     'master': '/etc/bybit-master.env',
 }
 
+# Wallet type per account. The master funding account keeps its lending pool in
+# the FUND (funding) wallet, not the unified trading wallet - verified live 2026-11-07
+# (master UNIFIED = 0.00 while FUND = 942.05). Subaccounts trade in UNIFIED.
+ACCOUNT_TYPES = {'master': 'FUND'}
+
 ENV_KEYS = ('BYBIT_API_KEY', 'BYBIT_API_SECRET', 'BYBIT_RSA_PRIVATE_KEY_FILE', 'BYBIT_PROXY', 'BYBIT_PROXY_FALLBACKS')
 
 
@@ -62,7 +67,16 @@ def client_for(account):
 
 
 def balance(account):
-    return float(client_for(account).get_account_summary().get('wallet_balance') or 0)
+    c = client_for(account)
+    if account == 'master':
+        d = c._get('/v5/asset/transfer/query-account-coins-balance',
+                   {'accountType': ACCOUNT_TYPES['master'], 'coin': 'USDT'})
+        r = d.get('result') or d
+        for b in (r.get('balance') or []):
+            if b.get('coin') == 'USDT':
+                return float(b.get('walletBalance') or 0)
+        return 0.0
+    return float(c.get_account_summary().get('wallet_balance') or 0)
 
 
 def transfer(src, dst, amount, execute=False):
@@ -80,8 +94,8 @@ def transfer(src, dst, amount, execute=False):
         'amount': str(amount),
         'fromMemberId': int(UIDS[src]),
         'toMemberId': int(UIDS[dst]),
-        'fromAccountType': 'UNIFIED',
-        'toAccountType': 'UNIFIED',
+        'fromAccountType': ACCOUNT_TYPES.get(src, 'UNIFIED'),
+        'toAccountType': ACCOUNT_TYPES.get(dst, 'UNIFIED'),
     }
     return c._post('/v5/asset/transfer/universal-transfer', body)
 
