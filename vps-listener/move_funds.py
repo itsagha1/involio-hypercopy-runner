@@ -21,6 +21,7 @@ UIDS = {
     'kings': '593123036',
     'bluespire': '593304088',
     'hypercopy': '600742547',
+    'master': '585090581',
 }
 
 ENVS = {
