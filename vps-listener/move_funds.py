@@ -40,6 +40,8 @@ ENVS = {
 # (master UNIFIED = 0.00 while FUND = 942.05). Subaccounts trade in UNIFIED.
 ACCOUNT_TYPES = {'master': 'FUND'}
 
+LEDGER_FILE = '/var/lib/hypercopy-copy/transfer_ledger.jsonl'
+
 ENV_KEYS = ('BYBIT_API_KEY', 'BYBIT_API_SECRET', 'BYBIT_RSA_PRIVATE_KEY_FILE', 'BYBIT_PROXY', 'BYBIT_PROXY_FALLBACKS')
 
 
@@ -79,6 +81,25 @@ def balance(account):
     return float(c.get_account_summary().get('wallet_balance') or 0)
 
 
+
+def record_ledger(src, dst, amount, res, kind='gradual'):
+    """Every successful transfer is recorded so invested figures stay exact."""
+    try:
+        import datetime
+        entry = {
+            'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+            'from': src, 'to': dst, 'amount': float(amount), 'kind': kind,
+            'from_wallet': ACCOUNT_TYPES.get(src, 'UNIFIED'),
+            'to_wallet': ACCOUNT_TYPES.get(dst, 'UNIFIED'),
+            'transfer_id': (res or {}).get('transferId'),
+            'status': (res or {}).get('status'),
+        }
+        with open(LEDGER_FILE, 'a') as f:
+            f.write(json.dumps(entry) + chr(10))
+    except Exception:
+        pass
+
+
 def transfer(src, dst, amount, execute=False):
     if src not in UIDS or dst not in UIDS:
         raise SystemExit('unknown account; known: ' + ','.join(sorted(UIDS)))
@@ -97,7 +118,10 @@ def transfer(src, dst, amount, execute=False):
         'fromAccountType': ACCOUNT_TYPES.get(src, 'UNIFIED'),
         'toAccountType': ACCOUNT_TYPES.get(dst, 'UNIFIED'),
     }
-    return c._post('/v5/asset/transfer/universal-transfer', body)
+    res = c._post('/v5/asset/transfer/universal-transfer', body)
+    if (res or {}).get('status') == 'SUCCESS':
+        record_ledger(src, dst, amount, res)
+    return res
 
 
 if __name__ == '__main__':
