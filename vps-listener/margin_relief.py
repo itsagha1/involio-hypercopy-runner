@@ -74,6 +74,10 @@ def main():
     now = time.time()
     mbal = master_balance()
     changed = False
+    if abs(float(state.get('master_pool_usd') or 0) - mbal) > 0.005:
+        state['master_pool_usd'] = round(mbal, 2)
+        state['master_pool_ts'] = now
+        changed = True
     for name in ACCOUNTS:
         try:
             c = mf.client_for(name)

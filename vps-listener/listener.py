@@ -1651,6 +1651,8 @@ def _build_fleet_snapshot():
         "mirror_stats": _ms,
         "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
         # owner 2026-11-02: net capital in = equity - realised PnL (estimate).
+        # owner 2026-11-07: master funding pool (FUND wallet) published by margin-relief
+        "master_pool_usd": _master_pool(),
         "invested_usd": (round(float(main.get("wallet_balance") or main.get("available_balance")
                                      or (main.get("bybit") or {}).get("balance"))
                                 - float((_ms or {}).get("cumulative_pnl") or 0), 2)
@@ -1874,6 +1876,15 @@ ACCOUNT_LABELS = {
     "copy-bluespire": "Sub account 05 (BLUESPIIRE)",
     "copy-hypercopy": "hypercopy",
 }
+
+
+def _master_pool():
+    """Master funding pool (FUND wallet), published by margin_relief.py."""
+    try:
+        with open('/var/lib/hypercopy-copy/margin_relief.json') as f:
+            return (json.load(f) or {}).get('master_pool_usd')
+    except Exception:
+        return None
 
 
 @app.get("/status/all")
