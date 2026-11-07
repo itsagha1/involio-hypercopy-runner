@@ -29,6 +29,18 @@ STATE_FILE = '/var/lib/hypercopy-copy/margin_relief.json'
 LOG_FILE = '/var/lib/hypercopy-copy/margin_relief.log'
 DRY_RUN = os.environ.get('MARGIN_RELIEF_DRY_RUN', '1') != '0'
 
+# Owner renamed the Bybit accounts 2026-11-07: never use the technical keys in
+# anything user-facing. Keys stay for wiring (state, ports, env files) only.
+LABELS = {
+    'main': 'AI Main account (BYBIT_MAIN)',
+    'mainport': 'Sub account 01 (MAINPORT)',
+    'bakery': 'Sub account 02 (BAKERY)',
+    'scalping': 'Sub account 03 (SCALPING)',
+    'kings': 'Sub account 04 (KINGS)',
+    'bluespire': 'Sub account 05 (BLUESPIIRE)',
+    'hypercopy': 'hypercopy',
+}
+
 ACCOUNTS = ('main', 'mainport', 'bakery', 'scalping', 'kings', 'bluespire', 'hypercopy')
 
 
@@ -79,8 +91,10 @@ def main():
         state['master_pool_ts'] = now
         changed = True
     for name in ACCOUNTS:
+        key = name
+        name = LABELS.get(key, key)
         try:
-            c = mf.client_for(name)
+            c = mf.client_for(key)
             summ = c.get_account_summary()
             wallet = float(summ.get('wallet_balance') or 0)
             avail = float(summ.get('available_balance') or 0)
@@ -89,7 +103,7 @@ def main():
             log('%s: read failed (%s)' % (name, str(e)[:70]))
             continue
         pct, used = margin_pct(wallet, pos)
-        st = state['accounts'].setdefault(name, {'outstanding': 0.0, 'last_action_ts': 0})
+        st = state['accounts'].setdefault(key, {'outstanding': 0.0, 'last_action_ts': 0})
         out = float(st.get('outstanding') or 0)
         if DRY_RUN or pct >= 70:
             log('%s: margin %.1f%% | wallet %.2f | outstanding %.2f' % (name, pct, wallet, out))
@@ -104,7 +118,7 @@ def main():
             log('%s: margin %.1f%% <= %.0f%% -> returning %.2f USDT to master (outstanding %.2f)' % (name, pct, REPAY_PCT, amount, out))
             if not DRY_RUN:
                 try:
-                    res = mf.transfer(name, 'master', amount, execute=True)
+                    res = mf.transfer(key, 'master', amount, execute=True)
                     if (res or {}).get('status') != 'SUCCESS':
                         log('%s: repayment not confirmed: %s' % (name, json.dumps(res)[:120]))
                         continue
