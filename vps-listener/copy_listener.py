@@ -385,6 +385,12 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
         rec["desired_source_qty"] = curr_sq
         return action
     except BybitError as e:
+        # Order-link ids are deterministic per (key, action, generation). If a
+        # placement raises AFTER Bybit accepted it, the same id is retried forever
+        # and bybit_api refuses it as a stale collision (MET 2026-11-07). Advance
+        # the generation so the retry uses a fresh id; the 600s guard still blocks
+        # adopting old fills.
+        rec["gen"] = int(rec.get("gen", 0)) + 1
         return f"{'SKIP' if 'too small' in str(e) else 'ERROR'} {key} sync_size: {e}"
 
 
@@ -428,6 +434,8 @@ def follow_source_close(client: BybitClient, p: Dict[str, Any], rec: Dict[str, A
                 f"{' at source ROI %+.2f%%' % (roi * 100) if roi is not None else ''} "
                 f"- mirror closed at market (loss followed, no retention)")
     except BybitError as e:
+        # fresh order-link generation per retry, same reason as sync_size
+        rec["gen"] = int(rec.get("gen", 0)) + 1
         return f"ERROR {key} follow_source_close: {e} - will retry next poll"
 
 
@@ -663,8 +671,27 @@ def reconcile_flat_mirrors(client, state):
     return chr(10).join(out)
 
 
+def _norm_manual(m):
+    """Self-heal manual entries: accept legacy dicts or 'SYM/side' strings."""
+    if isinstance(m, dict):
+        sym = str(m.get("symbol") or m.get("ticker") or "").upper().strip()
+        side = str(m.get("side") or "").lower().strip()
+        if side in ("buy", "long"):
+            side = "long"
+        elif side in ("sell", "short"):
+            side = "short"
+        return f"{sym}/{side}" if sym and side else ""
+    return str(m).strip()
+
+
 def poll_once() -> None:
     state = state_get()
+    # self-heal: dict-shaped manual entries crashed the poll loop 2026-11-04..11-07
+    _m_raw = state.get("manual") or []
+    _m_norm = [x for x in (_norm_manual(m) for m in _m_raw) if x]
+    if _m_norm != _m_raw:
+        state["manual"] = _m_norm
+        log_action(f"LOG STALE-CLEAN: normalized {len(_m_raw)} manual entr(ies) to 'SYM/side' form")
     client = BybitClient()
     errors = 0
     try:
@@ -900,6 +927,17 @@ def poll_once() -> None:
     # --- stale self-clean (owner 2026-10-12 directive) ---
     held_ids = set(by_id.keys())
     held_pairs = {(p["ticker"].upper(), p["side"].lower()) for p in positions}
+    # Owner manual positions may have NO source (e.g. PUMPFUN/long bought by hand
+    # or left from an earlier episode). Pruning them because the SOURCE lacks them
+    # silently un-protected them, and the hourly audit re-added them -> hourly churn.
+    try:
+        if client.configured:
+            for _x in client.get_positions():
+                if float(_x.get("size") or 0) > 0:
+                    held_pairs.add((str(_x.get("symbol") or "").upper().replace("USDT", ""),
+                                    "long" if _x.get("side") == "Buy" else "short"))
+    except Exception:
+        pass
     keep_manual = [m for m in state["manual"]
                    if len(m.split("/")) == 2 and (m.split("/")[0].upper(), m.split("/")[1].lower()) in held_pairs]
     if len(keep_manual) != len(state["manual"]):
