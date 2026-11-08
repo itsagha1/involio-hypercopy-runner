@@ -1,3 +1,4 @@
+import requests
 """
 Involio -> Bybit HyperCopy VPS listener v3.3 (CUTOVER FINAL DRAFT)
 
@@ -1918,6 +1919,96 @@ def status_all(x_signature: str = Header(default="")):
     payload = dict(_FLEET_CACHE["data"])
     payload["age_seconds"] = max(0, int(time.time() - _FLEET_CACHE["ts"]))
     return payload
+
+
+@app.post("/selfcheck/fix")
+def selfcheck_fix(x_signature: str = Header(default="")):
+    """Owner 2026-11-08: one-press repair behind the app's "Fix it" button.
+
+    Only bookkeeping - no trading decisions:
+      * main: drop retained records that no longer describe a separate live
+        position (flat, or the same symbol/side is already an active mirror,
+        which means we cannot tell the stakes apart and trailing on the wrong
+        position is a funds risk).
+      * copy engines: deregister mirrors whose position is flat, and label live
+        positions that are neither mirrored nor manual so nothing is orphaned.
+    Returns a plain summary the app can show to the owner.
+    """
+    secret = get_shared_secret()
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature or "", secret):
+        raise HTTPException(403, "bad signature")
+
+    fixed = []
+    problems = []
+
+    # ---- main account: prune stale retained records -----------------------
+    try:
+        loader = globals().get("state_get") or globals().get("load_state")
+        st = loader() if callable(loader) else json.load(open(STATE_FILE))
+        try:
+            client = BybitClient()
+            live = [p for p in client.get_positions() if float(p.get("size") or 0) > 0]
+        except Exception as e:
+            live = []
+            problems.append("main: could not read live positions (%s)" % str(e)[:80])
+        live_pairs = {(p.get("symbol"), "long" if p.get("side") == "Buy" else "short") for p in live}
+        mirror_pairs = {(v.get("symbol"), v.get("side")) for v in (st.get("mirrored") or {}).values()}
+        kept = []
+        for r in (st.get("retained") or []):
+            pair = (r.get("symbol"), r.get("side"))
+            if pair not in live_pairs:
+                fixed.append({"account": "main", "action": "dropped retained record",
+                              "detail": "%s %s - no live position" % (r.get("symbol"), r.get("side"))})
+                continue
+            if pair in mirror_pairs:
+                fixed.append({"account": "main", "action": "dropped retained record",
+                              "detail": "%s %s - identical to an active mirror, not separable"
+                                        % (r.get("symbol"), r.get("side"))})
+                continue
+            kept.append(r)
+        if len(kept) != len(st.get("retained") or []):
+            st["retained"] = kept
+            save_state(st)
+    except Exception as e:
+        problems.append("main repair failed: %s" % str(e)[:120])
+
+    # ---- copy engines: reconcile labels -----------------------------------
+    for _name, _port in (("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
+                         ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
+        try:
+            r = requests.get("http://127.0.0.1:%d/status" % _port, timeout=20)
+            d = r.json()
+            live = [p for p in ((d.get("bybit") or {}).get("positions") or [])
+                    if float(p.get("size") or 0) > 0]
+            live_pairs = {(p.get("symbol"), "long" if p.get("side") == "Buy" else "short")
+                          for p in live}
+            mir = d.get("mirrored") or {}
+            man = {tuple(m.split("/")[:2]) for m in (d.get("manual") or []) if isinstance(m, str) and "/" in m}
+            man_pairs = {(s.upper() + "USDT", sd) for s, sd in man}
+            stale = [k for k, v in mir.items() if (v.get("symbol"), v.get("side")) not in live_pairs]
+            orphans = [p for p in live_pairs if p not in {(v.get("symbol"), v.get("side")) for v in mir.values()}
+                       and p not in man_pairs]
+            if not stale and not orphans:
+                continue
+            body = {"deregister": stale,
+                    "manual_add": ["%s/%s" % (s.replace("USDT", ""), sd) for s, sd in orphans]}
+            requests.post("http://127.0.0.1:%d/audit/fix" % _port, json=body, timeout=25,
+                          headers={"x_signature": secret})
+            for k in stale:
+                fixed.append({"account": _name, "action": "deregistered mirror",
+                              "detail": "%s - position already flat" % k})
+            for s, sd in orphans:
+                fixed.append({"account": _name, "action": "protected position",
+                              "detail": "%s %s - was neither mirrored nor manual" % (s, sd)})
+        except Exception as e:
+            problems.append("%s: %s" % (_name, str(e)[:90]))
+
+    log_action("SELFCHECK-FIX %d item(s) repaired" % len(fixed) + (("; problems: " + "; ".join(problems)) if problems else ""))
+    return {"ok": True, "fixed_count": len(fixed), "fixed": fixed, "problems": problems,
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
 
 @app.get("/log")
 def log_endpoint(n:int=400):
