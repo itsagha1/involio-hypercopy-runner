@@ -1945,8 +1945,15 @@ def selfcheck_fix(x_signature: str = Header(default="")):
 
     # ---- main account: prune stale retained records -----------------------
     try:
-        loader = globals().get("state_get") or globals().get("load_state")
-        st = loader() if callable(loader) else json.load(open(STATE_FILE))
+        # mutate the LIVE state object when one is held, else the on-disk copy
+        st = None
+        for _g in ("STATE", "state", "_state", "_STATE", "CURRENT_STATE"):
+            _v = globals().get(_g)
+            if isinstance(_v, dict):
+                st = _v
+                break
+        if st is None:
+            st = load_state()
         try:
             client = BybitClient()
             live = [p for p in client.get_positions() if float(p.get("size") or 0) > 0]
