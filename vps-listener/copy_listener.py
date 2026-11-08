@@ -952,8 +952,20 @@ def poll_once() -> None:
                                     "long" if _x.get("side") == "Buy" else "short"))
     except Exception:
         pass
-    keep_manual = [m for m in state["manual"]
-                   if len(m.split("/")) == 2 and (m.split("/")[0].upper(), m.split("/")[1].lower()) in held_pairs]
+    def _manual_pair(m):
+        """Normalise a manual label to (TICKER, side). Accepts both 'HBAR/long'
+        and 'HBARUSDT/long' - the audit/selfcheck writers used the Bybit symbol
+        form, which never matched held_pairs (built from tickers) and so every
+        protection was pruned on the next poll (2026-11-08)."""
+        if not isinstance(m, str) or len(m.split("/")) != 2:
+            return None
+        sym, sd = m.split("/")
+        sym = sym.upper().strip()
+        if sym.endswith("USDT") and len(sym) > 4:
+            sym = sym[:-4]
+        return (sym, sd.lower().strip())
+
+    keep_manual = [m for m in state["manual"] if _manual_pair(m) in held_pairs]
     if len(keep_manual) != len(state["manual"]):
         pruned_m = [m for m in state["manual"] if m not in keep_manual]
         state["manual"] = keep_manual
