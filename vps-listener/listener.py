@@ -882,6 +882,16 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
         src_tp = float(rec.get("price_target") or 0)
         if src_tp > 0:
             tp_trigger = max(src_tp, act_thresh) if side == "long" else min(src_tp, act_thresh)
+        # Owner 2026-11-08: Bybit nets one position per symbol/side, so a
+        # source close cannot be "retained" separately while another mirror
+        # still holds the same pair - the record is phantom and its TP trigger
+        # would overwrite the live mirrors protection. Skip retention instead.
+        _others = [k for k, v in (state.get("mirrored") or {}).items()
+                   if k != key and v.get("symbol") == symbol and v.get("side") == side]
+        if _others:
+            return (f"SKIP RETAIN {key}: {symbol}/{side} still mirrored by {_others[0]}"
+                    f" - one exchange position, nothing separable to retain")
+
         try:
             inst = client.get_instrument(symbol)
             grid = Decimal(str(inst.get("priceFilter", {}).get("tickSize", "0.01")))
