@@ -1,4 +1,3 @@
-import requests
 """
 Involio -> Bybit HyperCopy VPS listener v3.3 (CUTOVER FINAL DRAFT)
 
@@ -7,6 +6,7 @@ Sole authorized source profile for Bybit cutover: `booobsas` (app.invoapp.com/bo
 """
 
 from __future__ import annotations
+import requests
 
 import asyncio
 import math
