@@ -2107,11 +2107,12 @@ def _master_pool():
 
 @app.get("/status/all")
 def status_all(x_signature: str = Header(default="")):
-    """Owner fleet overview: instant cached snapshot, warmed every 60s."""
-    secret = get_shared_secret()
-    if not secret:
-        raise HTTPException(500, "listener secret not configured")
-    if not hmac.compare_digest(x_signature, secret):
+    """Owner fleet overview: instant cached snapshot, warmed every 60s.
+
+    Owner 2026-11-09 (integration-credit reduction): the dashboard calls this
+    endpoint straight from the browser, so accept any fleet-level secret via
+    _sig_ok. It is read-only. Trading actions keep the strict check."""
+    if not _sig_ok(x_signature or ""):
         raise HTTPException(403, "bad signature")
     if _FLEET_CACHE["data"] is None:
         _FLEET_CACHE["data"] = _build_fleet_snapshot()
