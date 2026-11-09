@@ -2198,6 +2198,9 @@ def source_lost(body: dict = Body(default=None), x_signature: str = Header(defau
     prof = str((body or {}).get("profile") or "").strip()
     if not prof:
         raise HTTPException(400, "profile required")
+    if prof not in AUTHORIZED_PROFILES:
+        # Never let a typo or a probe write junk into the lost-source bookkeeping.
+        raise HTTPException(400, "unknown source profile: " + prof)
 
     state = load_state()
     mirrored = state.get("mirrored") or {}
