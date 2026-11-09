@@ -2122,6 +2122,45 @@ def status_all(x_signature: str = Header(default="")):
     return payload
 
 
+
+@app.post("/kb/list")
+def kb_list(x_signature: str = Header(default="")):
+    """The permanent issue memory, readable by any agent or the app."""
+    if not _sig_ok(x_signature or ""):
+        raise HTTPException(403, "bad signature")
+    import kb as _kb
+    entries = _kb.load()
+    return {"ok": True, "count": len(entries), "entries": entries}
+
+
+@app.post("/kb/add")
+def kb_add(body: dict = Body(default=None), x_signature: str = Header(default="")):
+    """Record a newly discovered issue so it is never rediscovered from zero."""
+    if not _sig_ok(x_signature or ""):
+        raise HTTPException(403, "bad signature")
+    import kb as _kb
+    b = body or {}
+    if not b.get("title"):
+        raise HTTPException(400, "title required")
+    entry = _kb.add(
+        title=b["title"],
+        symptoms=b.get("symptoms") or [],
+        root_cause=b.get("root_cause") or "",
+        fix=b.get("fix") or "",
+        files=b.get("files") or [],
+        verify=b.get("verify") or "",
+        area=b.get("area") or "general",
+        severity=b.get("severity") or "warning",
+        message_pattern=b.get("message_pattern"),
+        log_pattern=b.get("log_pattern"),
+        safety=b.get("safety") or "needs_approval",
+        auto_fixable=bool(b.get("auto_fixable")),
+        status=b.get("status") or "open",
+    )
+    log_action("KB-ADD %s %s" % (entry["id"], entry["title"][:70]))
+    return {"ok": True, "entry": entry}
+
+
 @app.post("/selfcheck/fix")
 def selfcheck_fix(x_signature: str = Header(default="")):
     """Owner 2026-11-08: one-press repair behind the app's "Fix it" button.
@@ -2243,8 +2282,31 @@ def selfcheck_fix(x_signature: str = Header(default="")):
         except Exception as e:
             problems.append("%s: %s" % (_name, str(e)[:90]))
 
+    # ---- teach the knowledge base what we just did ------------------------
+    kb_result = {}
+    try:
+        import kb as _kb
+        entries = _kb.load()
+        hit_ids = set()
+        blob = " ".join(((f.get("action") or "") + " " + (f.get("detail") or "")).lower() for f in fixed)
+        for e in entries:
+            sig = (e.get("fix_action_match") or "").lower()
+            if sig and sig in blob:
+                hit_ids.add(e["id"])
+                f_mark = e["id"]
+                for f in fixed:
+                    if sig in ((f.get("action") or "") + " " + (f.get("detail") or "")).lower():
+                        f["kb_id"] = f_mark
+        _kb.record(sorted(hit_ids), outcome="fixed" if fixed else "clean",
+                   detail="; ".join(f.get("detail") or "" for f in fixed)[:300],
+                   fixed=bool(fixed))
+        kb_result = {"matched": sorted(hit_ids), "entries": len(entries)}
+    except Exception as e:
+        kb_result = {"error": str(e)[:120]}
+
     log_action("SELFCHECK-FIX %d item(s) repaired" % len(fixed) + (("; problems: " + "; ".join(problems)) if problems else ""))
     return {"ok": True, "fixed_count": len(fixed), "fixed": fixed, "problems": problems,
+            "kb": kb_result,
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
@@ -2407,12 +2469,42 @@ def selfcheck_scan(x_signature: str = Header(default="")):
     except Exception:
         add("warning", "system", "no deep scan report available yet", False)
 
+    # ---- permanent issue knowledge base (owner 2026-11-09) ---------------
+    kb_summary = {}
+    try:
+        import kb as _kb
+        try:
+            with open("actions.log") as _f:
+                _tail = _f.read()[-400000:]
+        except Exception:
+            _tail = ""
+        analysis = _kb.analyse(items, _tail)
+        for it in items:
+            info = analysis["annotations"].get(it.get("message"))
+            if not info:
+                continue
+            it["kb"] = info
+            if info.get("regression"):
+                it["message"] = "%s  ·  REGRESSION of %s (%s), fixed %s" % (
+                    it["message"], info["id"], info.get("title"), info.get("fixed_on"))
+            else:
+                it["message"] = "%s  ·  known issue %s" % (it["message"], info["id"])
+        if analysis.get("regressions"):
+            _kb.flag_regressions([r["id"] for r in analysis["regressions"]])
+        kb_summary = {"entries": analysis.get("total_entries"),
+                      "known_matches": analysis.get("known"),
+                      "regressions": analysis.get("regressions")}
+    except Exception as e:
+        kb_summary = {"error": str(e)[:120]}
+
     order = {"critical": 0, "warning": 1, "info": 2}
     items.sort(key=lambda i: order.get(i["severity"], 3))
     fixable = sum(1 for i in items if i["fixable"])
-    log_action("SELFCHECK-SCAN %d finding(s), %d safe fix(es)" % (len(items), fixable))
+    log_action("SELFCHECK-SCAN %d finding(s), %d safe fix(es), kb %s" % (
+        len(items), fixable, (kb_summary or {}).get("entries")))
     return {"ok": True, "count": len(items), "fixable_count": fixable,
-            "items": items, "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            "items": items, "kb": kb_summary,
+            "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
 @app.get("/log")
