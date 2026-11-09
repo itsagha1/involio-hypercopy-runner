@@ -372,9 +372,23 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
                 # source qty is kept and the full remaining gap is retried every
                 # poll until it clears the exchange minimum (bigger source adds
                 # or wallet growth). Never counts as an engine error.
-                rec["desired_source_qty"] = curr_sq
-                return (f"SKIP {key} size_add: +{delta} (~{delta * last_px:.2f} USDT) "
-                        f"below Bybit 5 USDT minimum - accumulated, retried next poll")
+                # Owner 2026-11-09: a gap worth at least half the minimum is
+                # rounded UP to the 5 USDT floor, so a mirror cannot sit behind
+                # the source forever (azure11|LIT retried 3.60 USDT for days).
+                # Smaller gaps still accumulate.
+                if delta * last_px >= 2.5:
+                    _step = float(inst.get("lotSizeFilter", {}).get("qtyStep", "0.001") or "0.001")
+                    if _step > 0:
+                        _bumped = float((Decimal(str(5.0 / last_px)) / Decimal(str(_step)))
+                                        .to_integral_value(rounding=ROUND_CEILING)
+                                        * Decimal(str(_step)))
+                        _bumped = round(_bumped, 10)
+                        if _bumped * last_px >= 5.0:
+                            delta = _bumped
+                if delta * last_px < 5.0:
+                    rec["desired_source_qty"] = curr_sq
+                    return (f"SKIP {key} size_add: +{delta} (~{delta * last_px:.2f} USDT) "
+                            f"below Bybit 5 USDT minimum - accumulated, retried next poll")
             avail = float(client.get_available_balance() or 0)
             lev = int(rec.get("leverage") or 1) or 1
             if delta * float(client.get_ticker(symbol)["lastPrice"]) / lev > avail * MAX_AVAIL_PER_TRADE:
