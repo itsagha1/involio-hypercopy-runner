@@ -1806,6 +1806,9 @@ def _build_fleet_snapshot():
         # owner 2026-11-07: master funding pool (FUND wallet) published by margin-relief
         "master_pool_usd": _master_pool(),
         "invested_usd": _invested_exact().get("main"),
+        # Owner 2026-11-09: per-profile source health + lost flags for the app.
+        "source_health": _source_health(),
+        "source_lost": (main.get("source_lost") if isinstance(main, dict) else None) or {},
     })
     copies = [
         (8001, "copy-mainport", "henderson_14+billionaireboysclub+lazylegendx+prateek"), (8002, "copy-bakery", "nathanbrown+retrace+chatgptrades"),
