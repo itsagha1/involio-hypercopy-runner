@@ -2521,7 +2521,7 @@ def selfcheck_scan(x_signature: str = Header(default="")):
         _prof_map = {}
         try:
             import source_api as _sa
-            _prof_map = dict(_sa.PROFILES)
+            _prof_map = {v: k for k, v in dict(_sa.PROFILES).items()}
         except Exception:
             pass
         try:
