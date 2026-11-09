@@ -918,6 +918,14 @@ def execute_source_close(client: BybitClient, delta: Dict[str, Any], rec: Dict[s
         }
 
         state.setdefault("retained_trailing", {})[key] = ret_info
+        # Owner 2026-11-09: a retained position is no longer "mirroring". Leaving
+        # the mirror record here hid the truth: the source-lost sweep skips keys
+        # in retained_trailing, so the record was never reconciled and the app
+        # kept showing "Mirroring" for a trade the source had closed days ago
+        # (johndrockefeller BTC long, closed 2026-10-30). Drop the mirror record
+        # so the position is shown as retained/owner-managed, which it is.
+        state.get("mirrored", {}).pop(key, None)
+        state.get("source_missing", {}).pop(key, None)
         save_state(state)
 
         return (f"TRAIL RETAINED {key} source_close: losing exit (net {net_return * 100:+.2f}%) "
