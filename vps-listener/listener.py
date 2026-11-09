@@ -87,6 +87,47 @@ def normalize_trader(trader: str) -> str:
     return t
 
 
+def _accepted_secrets():
+    """Every shared secret this host legitimately uses.
+
+    The listener keeps WEBHOOK_SHARED_SECRET in vps-listener/.env while each copy
+    engine (and some older app builds) hold their own copy in /etc/copy-*.env.
+    A caller holding any of them is the owner's own fleet, so accept the whole
+    set instead of failing with "bad signature" whenever the app happens to
+    send the copy-engine value (2026-11-09)."""
+    out = set()
+    try:
+        if get_shared_secret():
+            out.add(get_shared_secret())
+    except Exception:
+        pass
+    for path in ['/etc/copy-mainport.env', '/etc/copy-bakery.env', '/etc/copy-scalping.env',
+                 '/etc/copy-kings.env', '/etc/copy-bluespire.env', '/etc/copy-hypercopy.env']:
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith('WEBHOOK_SHARED_SECRET='):
+                        v = line.split('=', 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            out.add(v)
+        except Exception:
+            continue
+    return out
+
+
+def _sig_ok(sig: str) -> bool:
+    if not sig:
+        return False
+    ok = False
+    for cand in _accepted_secrets():
+        try:
+            if hmac.compare_digest(sig, cand):
+                ok = True
+        except Exception:
+            continue
+    return ok
+
+
 def get_shared_secret() -> str:
     return os.environ.get("WEBHOOK_SHARED_SECRET") or SHARED_SECRET
 
@@ -1952,10 +1993,7 @@ def selfcheck_fix(x_signature: str = Header(default="")):
         positions that are neither mirrored nor manual so nothing is orphaned.
     Returns a plain summary the app can show to the owner.
     """
-    secret = get_shared_secret()
-    if not secret:
-        raise HTTPException(500, "listener secret not configured")
-    if not hmac.compare_digest(x_signature or "", secret):
+    if not _sig_ok(x_signature or ""):
         raise HTTPException(403, "bad signature")
 
     fixed = []
@@ -2043,10 +2081,7 @@ def selfcheck_scan(x_signature: str = Header(default="")):
     Read-only sweep - it never trades, moves funds or deletes data. Returns a
     flat list of findings the app can show, each marked fixable (safe auto-fix
     exists) or manual (needs the owner's decision)."""
-    secret = get_shared_secret()
-    if not secret:
-        raise HTTPException(500, "listener secret not configured")
-    if not hmac.compare_digest(x_signature or "", secret):
+    if not _sig_ok(x_signature or ""):
         raise HTTPException(403, "bad signature")
 
     items = []
