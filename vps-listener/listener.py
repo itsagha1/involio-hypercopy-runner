@@ -1653,6 +1653,7 @@ def health():
     return {"ok":error is None,"status":"ok" if error is None else "error",
             "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"multi_profile_full_balance",
             "source_lost":state.get("source_lost") or {},
+            "source_health":_source_health(),
             "sole_source_profile":None,"authorized_profiles":sorted(AUTHORIZED_PROFILES),"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
             "proxy":"set" if os.environ.get("BYBIT_PROXY") else "missing","bybit_configured":client.configured,
             "wallet_balance":wallet,"available_balance":avail,"bybit":{"balance":account.get("margin_balance"),"positions":positions,"age_seconds":(round(age) if age is not None else None),**({"error":error} if error else {})},
@@ -1743,6 +1744,28 @@ def _invested_exact():
             out[fid] = round(float(v.get('invested') or 0), 2)
         except Exception:
             pass
+    return out
+
+
+def _source_health():
+    """Per-profile source health for the app: last successful fetch and whether
+    the profile is currently considered lost. Written by source_health.py."""
+    try:
+        with open('/var/lib/hypercopy-copy/source_health.json') as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for prof, rec in raw.items():
+        if not isinstance(rec, dict):
+            continue
+        out[prof] = {
+            "lost": bool(rec.get("lost")),
+            "last_ok_ts": rec.get("last_ok"),
+            "fails": rec.get("fails") or 0,
+            "open_positions": rec.get("open_positions"),
+            "last_error": rec.get("last_error"),
+        }
     return out
 
 
