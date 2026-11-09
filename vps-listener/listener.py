@@ -2027,6 +2027,93 @@ def selfcheck_fix(x_signature: str = Header(default="")):
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+
+@app.post("/selfcheck/scan")
+def selfcheck_scan(x_signature: str = Header(default="")):
+    """Owner 2026-11-08: step 1 of the app's "Scan & Fix".
+
+    Read-only sweep - it never trades, moves funds or deletes data. Returns a
+    flat list of findings the app can show, each marked fixable (safe auto-fix
+    exists) or manual (needs the owner's decision)."""
+    secret = get_shared_secret()
+    if not secret:
+        raise HTTPException(500, "listener secret not configured")
+    if not hmac.compare_digest(x_signature or "", secret):
+        raise HTTPException(403, "bad signature")
+
+    items = []
+    now = time.time()
+
+    def add(sev, area, msg, fixable=False):
+        items.append({"severity": sev, "area": area, "message": msg, "fixable": bool(fixable)})
+
+    # --- engines: liveness, errors, margin, label consistency -------------
+    for _name, _port in (("main", 8000), ("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
+                         ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
+        try:
+            d = requests.get("http://127.0.0.1:%d/status" % _port, timeout=20).json()
+        except Exception as e:
+            add("critical", _name, "engine status unreachable (%s)" % str(e)[:60], False)
+            continue
+        if d.get("errors_last_run"):
+            add("warning", _name, "%s error(s) in the last poll" % d["errors_last_run"], False)
+        lp = d.get("last_poll")
+        if lp:
+            try:
+                age = now - datetime.fromisoformat(lp).timestamp()
+                if age > (600 if _name == "main" else 900):
+                    add("critical", _name, "no poll for %d minutes" % (age // 60), True)
+            except Exception:
+                pass
+        mp = d.get("margin_pct")
+        if isinstance(mp, (int, float)) and mp >= 90:
+            add("critical", _name, "margin %.1f%% - relief should borrow from master" % mp, False)
+        live = [p for p in ((d.get("bybit") or {}).get("positions") or []) if float(p.get("size") or 0) > 0]
+        live_pairs = {(p.get("symbol"), "long" if p.get("side") == "Buy" else "short") for p in live}
+        mir = d.get("mirrored") or {}
+        mir_pairs = {(v.get("symbol"), v.get("side")) for v in mir.values()}
+        for k, v in mir.items():
+            if (v.get("symbol"), v.get("side")) not in live_pairs:
+                add("warning", _name, "mirror %s has no live position - deregister" % k.split("|")[0] + " " + str(v.get("symbol")), True)
+        def _pair(m):
+            if not isinstance(m, str) or "/" not in m:
+                return None
+            a, b = m.split("/")[:2]
+            a = a.upper()
+            if a.endswith("USDT") and len(a) > 4:
+                a = a[:-4]
+            return (a, b.lower())
+        man_pairs = {_pair(m) for m in (d.get("manual") or [])}
+        for pair in sorted(p for p in live_pairs if p[0]):
+            short = (pair[0].replace("USDT", ""), pair[1])
+            if pair not in mir_pairs and short not in man_pairs:
+                add("warning", _name, "live %s %s is neither mirrored nor owner-managed - adopt" % pair, True)
+        for m in (d.get("manual") or []):
+            pr = _pair(m)
+            if pr and (pr[0] + "USDT", pr[1]) not in live_pairs:
+                add("info", _name, "owner-managed label %s has no live position - clear label" % m, True)
+
+    # --- code / config findings from the daily deep scan ------------------
+    try:
+        with open("/var/lib/hypercopy-copy/deep_scan.json") as f:
+            scan = json.load(f)
+        for fnd in scan.get("findings") or []:
+            if fnd.get("sev") in ("critical", "warning"):
+                add(fnd["sev"], fnd.get("area", "system"), fnd.get("msg", ""), False)
+        age_h = (now - datetime.fromisoformat(scan["ts"]).timestamp()) / 3600.0
+        if age_h > 30:
+            add("warning", "system", "daily deep scan is %.0fh old - scan overdue" % age_h, False)
+    except Exception:
+        add("warning", "system", "no deep scan report available yet", False)
+
+    order = {"critical": 0, "warning": 1, "info": 2}
+    items.sort(key=lambda i: order.get(i["severity"], 3))
+    fixable = sum(1 for i in items if i["fixable"])
+    log_action("SELFCHECK-SCAN %d finding(s), %d safe fix(es)" % (len(items), fixable))
+    return {"ok": True, "count": len(items), "fixable_count": fixable,
+            "items": items, "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
 @app.get("/log")
 def log_endpoint(n:int=400):
     return {"ok":True,"code_version":LISTENER_VERSION,"lines":log_tail(min(max(n,1),2000))}
