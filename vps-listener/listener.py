@@ -2495,6 +2495,47 @@ def selfcheck_scan(x_signature: str = Header(default="")):
     except Exception:
         add("warning", "system", "no deep scan report available yet", False)
 
+    # ---- fixed issues still in force? (silent-overwrite detection) -------
+    try:
+        import kb as _kb0
+        _eng = {}
+        for _n, _p in (("main", 8000), ("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
+                       ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
+            try:
+                _eng[_n] = requests.get("http://127.0.0.1:%d/status" % _p, timeout=20).json()
+            except Exception:
+                pass
+        _ledger = {}
+        try:
+            with open("/var/lib/hypercopy-copy/invest_exact.json") as _f:
+                for _k, _v in ((json.load(_f) or {}).get("accounts") or {}).items():
+                    _ledger["main" if _k == "main" else "copy-" + _k] = _v.get("invested")
+        except Exception:
+            pass
+        _owners = {}
+        try:
+            with open("/var/lib/hypercopy-copy/source_owners.json") as _f:
+                _owners = json.load(_f) or {}
+        except Exception:
+            pass
+        _prof_map = {}
+        try:
+            import source_api as _sa
+            _prof_map = dict(_sa.PROFILES)
+        except Exception:
+            pass
+        try:
+            with open("listener.py") as _f:
+                _src = _f.read()
+        except Exception:
+            _src = ""
+        for _fnd in _kb0.assertions({"engines": _eng, "ledger": _ledger, "state": load_state(),
+                                     "owners": _owners, "portfolios": _prof_map, "source": _src}):
+            add("critical", "regression",
+                "%s  ·  a previous fix is no longer in force" % _fnd["message"], False)
+    except Exception as _e:
+        add("info", "regression", "fix assertion pass skipped (%s)" % str(_e)[:70], False)
+
     # ---- permanent issue knowledge base (owner 2026-11-09) ---------------
     kb_summary = {}
     try:

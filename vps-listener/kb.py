@@ -217,3 +217,80 @@ def add(title: str, symptoms: list, root_cause: str, fix: str, files: list,
     entries.append(entry)
     save(entries)
     return entry
+
+"""Assertions that previous fixes are still in force.
+
+A fix that has been overwritten by later work looks exactly like a healthy
+system until it bites. Each assertion re-checks a fixed issue's invariant from
+the live data, so a silent revert is reported as a regression.
+
+ctx keys (all optional, checks skip when data is unavailable):
+  engines  {account_id: status dict}
+  ledger   {account_key: exact invested from invest_exact.json}
+  state    main listener state
+  health   source_health map
+  source   listener source text
+"""
+from __future__ import annotations
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def assertions(ctx: dict) -> list:
+    out = []
+
+    def fail(eid, msg):
+        out.append({'id': eid, 'message': msg})
+
+    # KB-001 the invested figure must equal the transfer ledger
+    ledger = ctx.get('ledger') or {}
+    for name, st in (ctx.get('engines') or {}).items():
+        inv = _num((st or {}).get('invested_usd'))
+        exp = _num(ledger.get('main' if name == 'main' else 'copy-' + str(name)))
+        if inv is not None and exp is not None and abs(inv - exp) > 0.011:
+            fail('KB-001', '%s: invested %.2f does not match the transfer ledger %.2f'
+                 % (name, inv, exp))
+
+    # KB-002 a retained position must never also claim to be a mirror
+    state = ctx.get('state') or {}
+    both = set(state.get('mirrored') or {}) & set(state.get('retained_trailing') or {})
+    for key in both:
+        fail('KB-002', 'retained position is still registered as a mirror: %s' % key)
+
+    # KB-003 manual labels must use the ticker form, never the Bybit symbol form
+    for label in (state.get('manual') or []):
+        if isinstance(label, str) and 'USDT/' in label.upper():
+            fail('KB-003', 'owner-managed label uses the symbol form: %s' % label)
+
+    # KB-006 every source portfolio must have a recorded identity
+    owners = ctx.get('owners') or {}
+    for pid, prof in (ctx.get('portfolios') or {}).items():
+        if pid not in owners:
+            fail('KB-006', 'portfolio %s (%s) has no recorded identity, a rename would go unnoticed'
+                 % (str(pid)[:8], prof))
+
+    # KB-013 the listener must still allow the dashboard to call it directly
+    src = ctx.get('source') or ''
+    if src and 'CORSMiddleware' not in src:
+        fail('KB-013', 'CORS middleware is missing again, the dashboard falls back to paid function calls')
+
+    # KB-004 the app token must still be accepted
+    if src and '_ALLOWED_FP' not in src:
+        fail('KB-004', 'the app token fingerprints were removed, app calls will 403 again')
+
+    # KB-007 a lost source must not still be mirrored
+    lost = set((state.get('source_lost') or {}))
+    for key in (state.get('mirrored') or {}):
+        if key.split('|')[0] in lost:
+            fail('KB-007', 'mirror still active for a source marked lost: %s' % key)
+
+    # KB-008 exchange rate limiting must remain in place
+    if src and 'RATE_COOLDOWN' not in src and '10006' not in src:
+        fail('KB-008', 'the 10006 rate-limit guard is gone from the listener')
+
+    return out
