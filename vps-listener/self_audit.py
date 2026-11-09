@@ -582,6 +582,95 @@ def check_margin_hold(account, status, findings):
                      '<= %.0f%%) - existing positions unaffected' % (pct, MARGIN_RELEASE_PCT))
 
 
+def check_code_regressions(findings):
+    """E. bug classes already fixed on this box must never silently return.
+
+    Every check here corresponds to a real incident, and each one is cheap and
+    read-only. They run once per audit, not per account.
+      - code_missing_import : a module uses time./math./os. without importing it.
+        Incident 2026-11-09: source_api.py called time.sleep() in its retry path
+        with no `import time`, so ANY portfolio whose first fetch failed died on
+        a NameError and was frozen all day (prateek copied nothing).
+      - source_book_frozen : a 'book degraded' line appears in today's log.
+      - stuck_size_add     : a size-add worth >= 2.5 USDT still being retried as
+        'below Bybit 5 USDT minimum'. Incident 2026-11-09: such adds were retried
+        every poll forever, so mirrors drifted behind the source (azure11|LIT
+        stuck at 3.60 USDT for days). Fixed by rounding up to the 5 USDT floor.
+      - git_dirty_tree     : tracked files modified but not committed. The
+        autoupdater runs `git pull`; a dirty tree makes every pull fail and the
+        box silently stops receiving fixes.
+    """
+    import glob as _glob
+    import re as _re
+    import subprocess as _sub
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    mods = [os.path.join(here, f) for f in ('source_api.py', 'copy_listener.py',
+                                            'bybit_api.py', 'self_audit.py')]
+    for path in mods:
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        _CHECKS = (('time', r'(?<![\w.])time\.[a-z_]+\('),
+                   ('math', r'(?<![\w.])math\.[a-z_]+\('),
+                   ('datetime', r'(?<![\w.])(?:timedelta|timezone)\('),
+                   ('decimal', r'(?<![\w.])Decimal\('),
+                   ('json', r'(?<![\w.])json\.[a-z_]+\('),
+                   ('os', r'(?<![\w.])os\.[a-z_]+\('),
+                   ('re', r'(?<![\w.])re\.[a-z_]+\('),
+                   ('subprocess', r'(?<![\w.])subprocess\.[a-z_]+\('))
+        for mod, token in _CHECKS:
+            if _re.search(token, text) and \
+               not _re.search(r'^\s*(?:import[^\n]*\b%s\b|from\s+%s\s+import)' % (mod, mod),
+                              text, _re.M):
+                findings.add(os.path.basename(path), 'code_missing_import', 'critical',
+                             'module uses %s.* but never imports %s - this is the '
+                             'prateek-freeze bug class (NameError on a retry path)'
+                             % (mod, mod))
+
+    from datetime import timedelta as _td
+    cut = now() - _td(hours=24)
+    stuck = {}
+    for log in _glob.glob('/var/lib/hypercopy-copy/*_actions.log'):
+        try:
+            lines = open(log, errors='ignore').read().splitlines()[-4000:]
+        except OSError:
+            continue
+        acct = os.path.basename(log).replace('_actions.log', '')
+        for line in lines:
+            m = _re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\]', line)
+            if not m:
+                continue
+            try:
+                ts = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if 'book degraded' in line and ts >= cut:
+                findings.add(acct, 'source_book_frozen', 'high',
+                             'a source book failed to load this day: %s' % line[-160:],
+                             subject=line.split('book degraded')[0].strip()[-40:])
+            if 'below Bybit 5 USDT minimum' in line and 'size_add' in line:
+                gm = _re.search(r'\(~([\d.]+) USDT\)', line)
+                if gm and float(gm.group(1)) >= 2.5 and ts >= now() - _td(hours=6):
+                    stuck[line.split('] ', 1)[-1][:90]] = stuck.get(line.split('] ', 1)[-1][:90], 0) + 1
+    for sig, n in sorted(stuck.items(), key=lambda kv: -kv[1])[:3]:
+        findings.add('fleet', 'stuck_size_add', 'high',
+                     'a near-minimum size-add is still being retried instead of '
+                     'rounded up to the 5 USDT floor (%d times in 24h): %s' % (n, sig))
+
+    try:
+        out = _sub.run(['git', '-C', os.path.dirname(here), 'status', '--porcelain'],
+                       capture_output=True, text=True, timeout=20).stdout
+        dirty = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith('??')]
+        if dirty:
+            findings.add('fleet', 'git_dirty_tree', 'high',
+                         'tracked files are modified but uncommitted, so the autoupdater '
+                         'cannot pull new fixes: %s' % ', '.join(d.strip()[:40] for d in dirty[:4]))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ------------------------------------------------------------------ driver
 
 def audit_account(name, port, is_main, findings, prev_keys, apply_fixes):
@@ -635,6 +724,7 @@ def main(argv):
 
     findings = Findings()
     started = now()
+    check_code_regressions(findings)
     audit_account('main', MAIN_PORT, True, findings, prev_keys, apply_fixes)
     for port, name in COPY_ACCOUNTS:
         audit_account(name, port, False, findings, prev_keys, apply_fixes)
