@@ -30,6 +30,7 @@ except (ImportError, PermissionError):
     pass
 
 from fastapi import FastAPI, Request, Header, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from bybit_api import (BybitClient, BybitError, bybit_side, close_side,
@@ -60,7 +61,13 @@ LOG_TAIL_LINES = 60
 STATE_LOCK = threading.RLock()
 RISK_TASK = None
 
+# Owner 2026-11-09: the dashboard may call the listener directly from the
+# browser, which removes a Base44 backend-function invocation (and its
+# integration credit) from every refresh.
 app = FastAPI(title="Bybit mirror v3.7: booobsas, akira Crypto, oozypath")
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
+                   allow_methods=['GET', 'POST', 'OPTIONS'],
+                   allow_headers=['Content-Type', 'X-Signature'])
 
 
 class WebhookPayload(BaseModel):
@@ -1895,17 +1902,75 @@ def _main_self_poll_loop():
                     except _rq.exceptions.RequestException:
                         if attempt == 2: break
                         time.sleep(2 + attempt * 2)
+            secret = get_shared_secret()
             if books:
                 st = load_state()
                 payload = {"source": "vps-self-poll", "fired_at": datetime.now(timezone.utc).isoformat(),
                            "books": books, "recents": {}, "hold_new": bool(st.get("hold_new", False)),
                            "cutover_action": None}
-                secret = get_shared_secret()
                 if secret:
                     r = _rq.post("http://127.0.0.1:8000/webhook/involio-delta", json=payload,
                                  headers={"X-Signature": secret}, timeout=120)
                     if not r.ok:
                         log_action(f"LOG self-poll delivery HTTP {r.status_code}; will retry next cycle")
+
+            # Owner 2026-11-09: source health lives here, in the loop that already
+            # fetches every profile every 60s - no separate timer, no extra cost.
+            # A profile that keeps failing for 6h is parked: its mirrors become
+            # owner-managed with a TP until the source comes back.
+            try:
+                _now = time.time()
+                _hp = "/var/lib/hypercopy-copy/source_health.json"
+                try:
+                    with open(_hp) as _f:
+                        _hist = json.load(_f)
+                except Exception:
+                    _hist = {}
+                _lost = []
+                for _prof in sorted(AUTHORIZED_PROFILES):
+                    _rec = _hist.get(_prof) or {}
+                    if _prof in books:
+                        if _rec.get("lost"):
+                            log_action(f"SOURCE-RECOVERED {_prof}: book readable again")
+                            with STATE_LOCK:
+                                _s2 = load_state()
+                                (_s2.get("source_lost") or {}).pop(_prof, None)
+                                save_state(_s2)
+                        _rec.update({"last_ok": _now, "fails": 0, "lost": False, "last_error": None,
+                                     "open_positions": len((books[_prof].get("positions") or []))})
+                        _rec.pop("first_fail", None)
+                    else:
+                        _rec["fails"] = int(_rec.get("fails") or 0) + 1
+                        _rec.setdefault("first_fail", _now)
+                        _rec["last_error"] = "book unavailable"
+                        if (_now - float(_rec["first_fail"])) / 3600.0 >= 6 and not _rec.get("lost"):
+                            _lost.append(_prof)
+                    _hist[_prof] = _rec
+                try:
+                    with open(_hp + ".tmp", "w") as _f:
+                        json.dump(_hist, _f, indent=1)
+                    os.replace(_hp + ".tmp", _hp)
+                except Exception:
+                    pass
+                for _prof in _lost:
+                    if secret:
+                        try:
+                            _r = _rq.post("http://127.0.0.1:8000/source/lost", json={"profile": _prof},
+                                          headers={"x-signature": secret}, timeout=90)
+                            if _r.ok:
+                                _hist[_prof]["lost"] = True
+                                log_action(f"SOURCE-LOST {_prof} after 6h: parked as owner-managed")
+                        except Exception:
+                            pass
+                if _lost:
+                    try:
+                        with open(_hp + ".tmp", "w") as _f:
+                            json.dump(_hist, _f, indent=1)
+                        os.replace(_hp + ".tmp", _hp)
+                    except Exception:
+                        pass
+            except Exception as _e:
+                log_action(f"LOG source health check failed: {str(_e)[:80]}")
         except Exception:
             pass
         time.sleep(60)
