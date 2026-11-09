@@ -2251,6 +2251,32 @@ def selfcheck_fix(x_signature: str = Header(default="")):
     except Exception as e:
         problems.append("main source reconciliation failed: %s" % str(e)[:100])
 
+    # ---- main: adopt live positions that are neither mirrored nor manual ----
+    try:
+        _st3 = load_state()
+        _mir3 = {v.get("symbol") for v in (_st3.get("mirrored") or {}).values()}
+        _man3 = _st3.setdefault("manual", [])
+        _client3 = BybitClient()
+        _live3 = [p for p in _client3.get_positions() if float(p.get("size") or 0) > 0]
+        _known3 = set()
+        for m in _man3:
+            if isinstance(m, str) and "/" in m:
+                _sym, _sd = m.split("/")[:2]
+                _known3.add((_sym.upper().replace("USDT", ""), _sd.lower()))
+        for _p in _live3:
+            _sym = str(_p.get("symbol") or "").upper()
+            _sd = "long" if _p.get("side") == "Buy" else "short"
+            if _sym in _mir3 or (_sym.replace("USDT", ""), _sd) in _known3:
+                continue
+            _label = _sym.replace("USDT", "") + "/" + _sd
+            _man3.append(_label)
+            _known3.add((_sym.replace("USDT", ""), _sd))
+            fixed.append({"account": "main", "action": "protected position",
+                          "detail": "%s %s - live on the exchange, unlabelled" % (_sym, _sd)})
+        save_state(_st3)
+    except Exception as e:
+        problems.append("main orphan adoption failed: %s" % str(e)[:100])
+
     # ---- copy engines: reconcile labels -----------------------------------
     for _name, _port in (("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
                          ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
@@ -2475,7 +2501,9 @@ def selfcheck_scan(x_signature: str = Header(default="")):
         import kb as _kb
         try:
             with open("actions.log") as _f:
-                _tail = _f.read()[-400000:]
+                # Only the recent window counts: matching the whole history made
+                # every log-based entry look like a live regression forever.
+                _tail = "".join(_f.readlines()[-150:])
         except Exception:
             _tail = ""
         analysis = _kb.analyse(items, _tail)
