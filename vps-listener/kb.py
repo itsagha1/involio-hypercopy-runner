@@ -27,7 +27,6 @@ Entry shape:
   "occurrences": 1
 }
 """
-from __future__ import annotations
 
 import json
 import os
@@ -231,7 +230,6 @@ ctx keys (all optional, checks skip when data is unavailable):
   health   source_health map
   source   listener source text
 """
-from __future__ import annotations
 
 
 def _num(v):
