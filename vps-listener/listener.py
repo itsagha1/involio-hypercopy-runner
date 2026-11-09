@@ -1652,6 +1652,7 @@ def health():
     wallet=account.get("wallet_balance");avail=account.get("available_balance")
     return {"ok":error is None,"status":"ok" if error is None else "error",
             "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"multi_profile_full_balance",
+            "source_lost":state.get("source_lost") or {},
             "sole_source_profile":None,"authorized_profiles":sorted(AUTHORIZED_PROFILES),"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
             "proxy":"set" if os.environ.get("BYBIT_PROXY") else "missing","bybit_configured":client.configured,
             "wallet_balance":wallet,"available_balance":avail,"bybit":{"balance":account.get("margin_balance"),"positions":positions,"age_seconds":(round(age) if age is not None else None),**({"error":error} if error else {})},
@@ -2154,6 +2155,65 @@ def selfcheck_fix(x_signature: str = Header(default="")):
     return {"ok": True, "fixed_count": len(fixed), "fixed": fixed, "problems": problems,
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
+
+
+
+@app.post("/source/lost")
+def source_lost(body: dict = Body(default=None), x_signature: str = Header(default="")):
+    """Owner 2026-11-09: a source profile has been unreachable for over 6 hours.
+
+    Policy: never leave a trade silently mirroring a dead source. Deregister the
+    profile's mirrors, keep every live position as owner-managed, and place a
+    take-profit on it so it can still exit on its own while the source is gone.
+    Purely bookkeeping plus a protective TP - no position is closed here.
+    """
+    if not _sig_ok(x_signature or ""):
+        raise HTTPException(403, "bad signature")
+    prof = str((body or {}).get("profile") or "").strip()
+    if not prof:
+        raise HTTPException(400, "profile required")
+
+    state = load_state()
+    mirrored = state.get("mirrored") or {}
+    keys = [k for k in mirrored if k.split("|")[0] == prof]
+    client = BybitClient()
+    try:
+        live = {p.get("symbol"): p for p in client.get_positions() if float(p.get("size") or 0) > 0}
+    except Exception:
+        live = {}
+    acted = []
+    for k in keys:
+        rec = mirrored.pop(k)
+        symbol = rec.get("symbol")
+        side = rec.get("side")
+        label = str(symbol or "").upper().replace("USDT", "") + "/" + str(side)
+        held = live.get(symbol)
+        if held and (held.get("side") == "Buy") == (side == "long"):
+            man = state.setdefault("manual", [])
+            if label not in man:
+                man.append(label)
+            tp = rec.get("price_target")
+            note = "source lost - owner-managed"
+            if tp:
+                try:
+                    client.set_sl_tp(symbol, stop_loss=0, take_profit=float(tp),
+                                     position_idx=1 if side == "long" else 2)
+                    note += " - TP set at %s" % tp
+                except Exception as e:
+                    note += " - TP failed (%s)" % str(e)[:40]
+            acted.append({"key": k, "action": "owner-managed", "detail": note})
+        else:
+            acted.append({"key": k, "action": "deregistered", "detail": "position already flat"})
+        state.get("retained_trailing", {}).pop(k, None)
+        state.get("source_missing", {}).pop(k, None)
+    state["mirrored"] = mirrored
+    state.setdefault("source_lost", {})[prof] = {
+        "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "moved": len(acted),
+    }
+    save_state(state)
+    log_action("SOURCE-LOST %s: %d mirror(s) parked as owner-managed with TP" % (prof, len(acted)))
+    return {"ok": True, "profile": prof, "moved": len(acted), "actions": acted}
 
 
 @app.post("/selfcheck/scan")

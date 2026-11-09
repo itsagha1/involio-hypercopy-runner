@@ -82,12 +82,30 @@ def _owner_cache():
         return {}
 
 
-def _remember_owner(portfolio_id, owner_id, username):
+def _remember_owner(portfolio_id, owner_id, username, portfolio=None):
+    """Persist identity so a rename is detectable and a stranger is not.
+
+    Owner 2026-11-09 (booobsas -> inquisitor): the cache had NO entry for the
+    booobsas portfolio, so a rename looked exactly like a foreign account and
+    the whole book died silently. We now store the portfolio's own immutable
+    fingerprints (createdAt + title) alongside the owner, which lets a rename be
+    accepted while a genuinely transferred portfolio is still rejected."""
     try:
         cache = _owner_cache()
-        cache[portfolio_id] = {'owner_id': owner_id, 'username': username}
-        with open(_OWNER_CACHE_FILE, 'w') as f:
+        prev = cache.get(portfolio_id) or {}
+        p = portfolio or {}
+        cache[portfolio_id] = {
+            'owner_id': owner_id,
+            'username': username,
+            'usernames': sorted(set((prev.get('usernames') or []) + [username])) if username else prev.get('usernames'),
+            'created_at': p.get('createdAt') or prev.get('created_at'),
+            'title': p.get('title') if p.get('title') is not None else prev.get('title'),
+            'seen_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        }
+        tmp = _OWNER_CACHE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(cache, f, indent=0)
+        os.replace(tmp, _OWNER_CACHE_FILE)
     except Exception:
         pass
 
@@ -101,11 +119,27 @@ def check_owner(profile, portfolio_id, portfolio):
     uname = own.get('username')
     oid = own.get('id')
     if uname in allowed:
-        _remember_owner(portfolio_id, oid, uname)
+        _remember_owner(portfolio_id, oid, uname, portfolio)
         return
     rec = _owner_cache().get(portfolio_id) or {}
     if oid and rec.get('owner_id') == oid:
-        _remember_owner(portfolio_id, oid, uname)
+        _remember_owner(portfolio_id, oid, uname, portfolio)
+        return
+    # Same portfolio, new owner name (rename). Accept only when the portfolio's
+    # immutable identity matches what we recorded, so a transferred portfolio
+    # is still refused.
+    same_identity = bool(rec.get('created_at')) and \
+        rec.get('created_at') == (portfolio.get('createdAt') or rec.get('created_at')) and \
+        (rec.get('title') or '') == (portfolio.get('title') or rec.get('title') or '')
+    if same_identity:
+        try:
+            with open('/var/lib/hypercopy-copy/source_renames.log', 'a') as f:
+                f.write('%s SOURCE-RENAMED %s: %s -> %s (%s)\n' % (
+                    datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    portfolio_id, rec.get('username'), uname, portfolio.get('title')))
+        except Exception:
+            pass
+        _remember_owner(portfolio_id, oid, uname, portfolio)
         return
     raise SourceDataError('Wrong source owner')
 
