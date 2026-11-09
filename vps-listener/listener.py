@@ -87,6 +87,34 @@ def normalize_trader(trader: str) -> str:
     return t
 
 
+def _source_open_ids(profiles, budget_s=45):
+    """Source-side truth: which Involio position ids are still open per profile.
+
+    Used by /selfcheck/scan and /selfcheck/fix so a mirror whose source trade is
+    gone can never again sit labelled "Mirroring" for days (johndrockefeller BTC
+    long, found by the owner 2026-11-09 12 days later). Best effort: a profile
+    that fails to fetch is reported as unknown, never as closed.
+    """
+    out = {}
+    unknown = []
+    try:
+        import source_api
+    except Exception as e:
+        return {}, ["source_api unavailable: %s" % str(e)[:60]]
+    started = time.time()
+    for prof in profiles:
+        if time.time() - started > budget_s:
+            unknown.append(prof)
+            continue
+        try:
+            book = source_api.fetch_source_book(profile=prof)
+            ids = {str(p.get("source_id")) for p in (book.get("positions") or [])}
+            out[prof] = ids
+        except Exception as e:
+            unknown.append("%s (%s)" % (prof, str(e)[:40]))
+    return out, unknown
+
+
 def _accepted_secrets():
     """Every shared secret this host legitimately uses.
 
@@ -2058,6 +2086,39 @@ def selfcheck_fix(x_signature: str = Header(default="")):
     except Exception as e:
         problems.append("main repair failed: %s" % str(e)[:120])
 
+    # ---- main: mirrors whose source trade is gone -> retained/owner-managed ----
+    try:
+        _st2 = load_state()
+        _mir2 = _st2.get("mirrored") or {}
+        if _mir2:
+            _profs = sorted({k.split("|")[0] for k in _mir2})
+            _open2, _unknown2 = _source_open_ids(_profs, budget_s=40)
+            _changed = False
+            for k in list(_mir2):
+                prof = k.split("|")[0]
+                sid = k.split("|")[-1]
+                if prof not in _open2 or sid in _open2[prof]:
+                    continue
+                coin_side = k.split("|")[1]
+                _mir2.pop(k, None)
+                for d in (("retained_trailing", {}), ("source_missing", {})):
+                    pass
+                _st2.get("retained_trailing", {}).pop(k, None)
+                _st2.get("source_missing", {}).pop(k, None)
+                label = coin_side
+                man = _st2.setdefault("manual", [])
+                if label not in man:
+                    man.append(label)
+                fixed.append({"account": "main", "action": "relabelled as owner-managed",
+                              "detail": "%s - source no longer holds this trade" % label})
+                _changed = True
+            if _changed:
+                save_state(_st2)
+            for u in _unknown2:
+                problems.append("source not verified: %s" % u)
+    except Exception as e:
+        problems.append("main source reconciliation failed: %s" % str(e)[:100])
+
     # ---- copy engines: reconcile labels -----------------------------------
     for _name, _port in (("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
                          ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
@@ -2156,6 +2217,27 @@ def selfcheck_scan(x_signature: str = Header(default="")):
             pr = _pair(m)
             if pr and (pr[0] + "USDT", pr[1]) not in live_pairs:
                 add("info", _name, "owner-managed label %s has no live position - clear label" % m, True)
+
+    # --- mirrors vs the live source books (the ghost-mirror class) --------
+    try:
+        _st = load_state()
+        _mir = _st.get("mirrored") or {}
+        if _mir:
+            _profiles = sorted({k.split("|")[0] for k in _mir})
+            _open, _unknown = _source_open_ids(_profiles, budget_s=40)
+            for k in list(_mir):
+                prof = k.split("|")[0]
+                sid = k.split("|")[-1]
+                if prof not in _open:
+                    continue
+                if sid not in _open[prof]:
+                    add("warning", "main",
+                        "mirror %s: source trade %s is no longer open - label retained/owner-managed"
+                        % (k.split("|")[0] + " " + k.split("|")[1], sid[:8]), True)
+            for u in _unknown:
+                add("info", "main", "source book not verified this run: %s" % u, False)
+    except Exception as e:
+        add("info", "main", "source/mirror comparison skipped (%s)" % str(e)[:60], False)
 
     # --- code / config findings from the daily deep scan ------------------
     try:
