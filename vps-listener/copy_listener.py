@@ -84,6 +84,7 @@ PROFIT_SKIP_ROI = 0.02          # 2% profit-skip threshold (owner 2026-10-12)
 FEE_ALLOWANCE = 0.0012      # 0.12% roundtrip fee allowance for source-lost breakeven math
 TP_TRIGGER_OFFSET = 0.005  # +0.5% beyond fee-adjusted breakeven for the retained TP trigger
 TRAILING_DIST_PCT = 0.005  # 0.5% price trailing distance (same rule as the main listener)
+_STATE_REF = [None]
 MAX_LEVERAGE = 50
 MIN_NOTIONAL = 5.0
 MARGIN_CAP = 0.70               # guard: total margin cap of wallet (like main listener)
@@ -213,6 +214,25 @@ def desired_margin(p: Dict[str, Any], wallet: float) -> Tuple[float, Optional[st
 
 def margin_used(state: Dict[str, Any]) -> float:
     return sum(float(r.get("margin") or 0) for r in state["mirrored"].values())
+
+
+def _reasons(key, why):
+    """Record why a source position is not mirrored (bounded, no log spam)."""
+    try:
+        st = _STATE_REF[0]
+    except (KeyError, IndexError):
+        return
+    if st is None:
+        return
+    store = st.setdefault("entry_reasons", {})
+    prev = (store.get(key) or {}).get("reason")
+    store[key] = {"reason": why,
+                  "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if len(store) > 400:
+        for k in sorted(store, key=lambda x: store[x].get("ts") or "")[:len(store) - 400]:
+            store.pop(k, None)
+    if prev != why:
+        log_action(f"NOT-MIRRORED {key}: {why}")
 
 
 # ---------------------------------------------------------------- entry
@@ -776,6 +796,7 @@ def poll_once() -> None:
         # Stats are dashboard cosmetics; keep stale values and keep polling.
         log_action(f"LOG source-stats refresh failed ({type(_e).__name__}: {str(_e)[:80]}); continuing with previous stats")
 
+    _STATE_REF[0] = state
     prev = state.get("books")
     positions = book.get("positions", [])
     by_id = {p["source_id"]: p for p in positions}
@@ -819,6 +840,15 @@ def poll_once() -> None:
     # --- new source trades ---
     for sid, p in by_id.items():
         if sid in prev_ids:
+            # Owner 2026-11-09: this used to `continue` in complete silence, so a
+            # position that entered a snapshot without ever being mirrored (a poll
+            # that aborted mid-loop, or a source that was frozen when it opened)
+            # stayed invisible FOREVER: no mirror, no block record, no log line.
+            # Ten _k2_ positions sat in that hole. Record the reason instead.
+            _k = tkey(p)
+            if _k not in state["mirrored"]:
+                _reasons(_k, "seen in an earlier poll but never mirrored "
+                             "(opened during a failed/blocked poll or before baselining)")
             continue
         if sid in state["baseline"]:
             blocks = state.setdefault("entry_blocks", {})
@@ -826,6 +856,7 @@ def poll_once() -> None:
             if key not in blocks:
                 blocks[key] = f"SKIP {key}: baseline position (never mirrored)"
                 log_action(blocks[key])
+            _reasons(key, "baseline position (never mirrored)")
             continue
         if DRY_RUN or not client.configured:
             roi = source_roi(p)
@@ -1144,6 +1175,7 @@ def status():
             "last_poll": state.get("last_poll"), "errors_last_run": state.get("errors_last_run"),
             "wallet": wallet, "bybit": bybit,
             "baseline_count": len(state.get("baseline", [])),
+            "entry_reasons": state.get("entry_reasons", {}),
             "mirrored": state.get("mirrored", {}),
             "retained": state.get("retained", {}),
             "source_missing": state.get("source_missing", {}),

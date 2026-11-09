@@ -434,12 +434,12 @@ def check_missed_mirrors(account, status, findings):
                 baseline_keys.add((m.group(1).upper(), side_norm(m.group(2))))
 
     covered = {}
-    for grp in ('mirrored', 'skip_watch', 'retained', 'entry_blocks'):
+    for grp in ('mirrored', 'skip_watch', 'retained', 'entry_blocks', 'entry_reasons'):
         src = status.get(grp) or {}
         if grp == 'retained' and isinstance(status.get('retained_trailing'), dict):
             src = status.get('retained_trailing')
-        if grp == 'entry_blocks':
-            src = st.get('entry_blocks') or {}
+        if grp in ('entry_blocks', 'entry_reasons'):
+            src = st.get(grp) or status.get(grp) or {}
         if isinstance(src, dict):
             for key in src:
                 parts = str(key).split('|')
