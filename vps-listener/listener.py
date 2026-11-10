@@ -1406,7 +1406,11 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
                     try:
                         _r = client._get("/v5/position/closed-pnl",
                                          {"category": "linear", "symbol": _rec.get("symbol"), "limit": "1"})
-                        _lst = ((_r.get("result") or {}).get("list") or [])
+                        # _get returns the result dict itself (list/nextPageCursor),
+                        # not a wrapped {result:...} - the WLD loss was invisible to
+                        # the app because this extraction always came back empty.
+                        _lst = (_r.get("list") if isinstance(_r, dict) and "list" in _r
+                                else ((_r.get("result") or {}).get("list") or []))
                         if _lst:
                             _pnl = float(_lst[0].get("closedPnl") or 0)
                     except Exception:
@@ -1725,6 +1729,7 @@ def health():
     return {"ok":error is None,"status":"ok" if error is None else "error",
             "code_version":LISTENER_VERSION,"version":LISTENER_VERSION,"mode":"multi_profile_full_balance",
             "source_lost":state.get("source_lost") or {},
+            "closed_ledger":state.get("closed_ledger") or {},
             "source_health":_source_health(),
             "sole_source_profile":None,"authorized_profiles":sorted(AUTHORIZED_PROFILES),"dry_run":DRY_RUN,"bybit_keys":"set" if client.configured else "missing",
             "proxy":"set" if os.environ.get("BYBIT_PROXY") else "missing","bybit_configured":client.configured,
@@ -1792,6 +1797,36 @@ def main_mirror_stats(mirrored):
             prof = str(k).split("|")[0].split(",")[0]
             current_open[str(k)] = prof
         data = _build(lines, recs, None, current_open, None)
+        # Owner 2026-11-11: trades that leave the exchange by SL/TP are not in the
+        # actions-log close events, so they never reached the per-source wins and
+        # losses (the owner saw "0 losses" while a -33.88 WLD loss sat on the
+        # account). Merge the closed ledger so every realised close is attributed.
+        try:
+            ledger = (load_state() or {}).get("closed_ledger") or {}
+            profs = data.setdefault("profiles", {})
+            for key, rec in ledger.items():
+                prof = str(rec.get("source") or str(key).split("|")[0])
+                if key in current_open:
+                    continue
+                blank = profs.setdefault(prof, {"trades": 0, "wins": 0, "losses": 0,
+                                                "realized_pnl": 0.0, "open_now": 0,
+                                                "closes_unmatched": 0})
+                pnl = rec.get("pnl")
+                if pnl is None:
+                    continue
+                if blank.get("_ledger_keys") and key in blank["_ledger_keys"]:
+                    continue
+                blank.setdefault("_ledger_keys", set()).add(key)
+                blank["trades"] += 1
+                blank["realized_pnl"] = round(float(blank.get("realized_pnl") or 0) + float(pnl), 4)
+                if float(pnl) >= 0:
+                    blank["wins"] += 1
+                else:
+                    blank["losses"] += 1
+            for p in profs.values():
+                p.pop("_ledger_keys", None)
+        except Exception:
+            pass
         _MAIN_MIRROR_STATS["data"] = data
         _MAIN_MIRROR_STATS["ts"] = _t.time()
         return data
@@ -2038,7 +2073,7 @@ def _main_self_poll_loop():
                 log_action(f"LOG source health check failed: {str(_e)[:80]}")
         except Exception:
             pass
-        time.sleep(60)
+        time.sleep(30)
 
 threading.Thread(target=_main_self_poll_loop, daemon=True, name="main-self-poll").start()
 
@@ -2146,7 +2181,7 @@ def _fleet_warm_loop():
             _FLEET_CACHE["ts"] = time.time()
         except Exception:
             pass
-        time.sleep(60)
+        time.sleep(30)
 
 threading.Thread(target=_fleet_warm_loop, daemon=True, name="fleet-warm").start()
 
