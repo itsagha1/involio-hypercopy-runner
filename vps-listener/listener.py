@@ -1802,7 +1802,14 @@ def main_mirror_stats(mirrored):
         # losses (the owner saw "0 losses" while a -33.88 WLD loss sat on the
         # account). Merge the closed ledger so every realised close is attributed.
         try:
-            ledger = (load_state() or {}).get("closed_ledger") or {}
+            # read the state FILE directly: this runs inside the fleet builder,
+            # which can already hold STATE_LOCK (load_state would raise there and
+            # silently blank the per-source stats).
+            try:
+                with open(STATE_FILE) as _f:
+                    ledger = (json.load(_f) or {}).get("closed_ledger") or {}
+            except Exception:
+                ledger = {}
             profs = data.setdefault("profiles", {})
             for key, rec in ledger.items():
                 prof = str(rec.get("source") or str(key).split("|")[0])
