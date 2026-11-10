@@ -777,7 +777,11 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
         # Attempt initial SL/TP if present
         if p.get("stop_loss") or p.get("price_target"):
             try:
-                client.set_sl_tp(symbol, p.get("stop_loss"), p.get("price_target"),
+                _sl0, _tp0 = _safe_targets(client, {"symbol": symbol, "side": side,
+                                                   "qty": p.get("source_qty"),
+                                                   "notional": p.get("source_margin")},
+                                           p.get("stop_loss"), p.get("price_target"))
+                client.set_sl_tp(symbol, _sl0, _tp0,
                                 position_idx=position_idx(symbol, side))
             except BybitError as e:
                 rec["sltp_pending"] = True
@@ -894,9 +898,51 @@ def sync_size(client: BybitClient, trader: str, p: Dict[str, Any], rec: Dict[str
         return f"{'SKIP' if 'too small' in str(e) else 'ERROR'} {key} sync_size: {e}"
 
 
+def _safe_targets(client: BybitClient, rec: Dict[str, Any], sl, tp):
+    """Owner 2026-11-11 - the WLD loss. We copied the source's take-profit
+    blindly. akira's TP sat at 0.31157 while OUR average entry was 0.3311, so
+    the "profit" order was a 5.9% loss order that filled at 0.3115 and cost
+    33.88 USDT on the no-loss account.
+
+    Rules now enforced on every SL/TP touch, for the main account:
+      1. a TP may never sit on the losing side of OUR entry (long: below
+         entry+fees, short: above entry-fees) - it is raised to breakeven+fees;
+      2. a TP already beyond the live price would fire instantly - drop it;
+      3. an SL already beyond the live price would fire instantly - drop it.
+    """
+    fee = float(globals().get("FEE_BUFFER", 0.0012) or 0.0012)
+    side = rec.get("side")
+    try:
+        entry = float(rec.get("entry_price") or 0)
+        if not entry:
+            qty = float(rec.get("qty") or 0)
+            if qty:
+                entry = float(rec.get("notional") or 0) / qty
+        if entry:
+            be = entry * (1 + fee) if side == "long" else entry * (1 - fee)
+            if tp:
+                tp = max(float(tp), be) if side == "long" else min(float(tp), be)
+    except Exception:
+        pass
+    try:
+        price = float(client.get_ticker(rec["symbol"])["lastPrice"])
+        if tp and ((side == "long" and float(tp) <= price) or (side == "short" and float(tp) >= price)):
+            log_action(f"SAFE-TP {rec.get('symbol')} {side}: source TP {tp} is on the wrong side of the live price {price}; not placing it")
+            tp = None
+        if sl and ((side == "long" and float(sl) >= price) or (side == "short" and float(sl) <= price)):
+            log_action(f"SAFE-SL {rec.get('symbol')} {side}: SL {sl} is on the wrong side of the live price {price}; not placing it")
+            sl = None
+    except BybitError:
+        pass
+    except Exception:
+        pass
+    return sl, tp
+
+
 def sync_sltp(client: BybitClient, trader: str, p: Dict[str, Any], rec: Dict[str, Any]) -> str:
     key = tkey(trader, p)
     sl, tp = p.get("stop_loss"), p.get("price_target")
+    sl, tp = _safe_targets(client, rec, sl, tp)
     try:
         client.set_sl_tp(rec["symbol"], sl, tp,
                         position_idx=position_idx(rec["symbol"], rec["side"]))
@@ -1355,6 +1401,25 @@ async def involio_delta(payload: WebhookPayload, x_signature: str = Header(defau
             pending = set(state.get("dereg_pending", []))
             for k in list(state["mirrored"].keys()):
                 if mirror_bybit_key(k) in missing_now and mirror_bybit_key(k) in pending:
+                    _rec = state["mirrored"].get(k) or {}
+                    _pnl = None
+                    try:
+                        _r = client._get("/v5/position/closed-pnl",
+                                         {"category": "linear", "symbol": _rec.get("symbol"), "limit": "1"})
+                        _lst = ((_r.get("result") or {}).get("list") or [])
+                        if _lst:
+                            _pnl = float(_lst[0].get("closedPnl") or 0)
+                    except Exception:
+                        pass
+                    log_action(f"EXCHANGE-CLOSED {k}: position gone from Bybit (stop or target filled), "
+                               f"realised pnl={_pnl}")
+                    try:
+                        state.setdefault("closed_ledger", {})[k] = {
+                            "symbol": _rec.get("symbol"), "side": _rec.get("side"),
+                            "pnl": _pnl, "reason": "exchange close (SL/TP filled)",
+                            "source": k.split("|")[0], "ts": time.time()}
+                    except Exception:
+                        pass
                     log_action(f"DEREGISTER {k}: position missing in Bybit - leaving unmanaged")
                     del state["mirrored"][k]
             state["dereg_pending"] = sorted(missing_now)
