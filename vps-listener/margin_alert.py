@@ -47,14 +47,10 @@ def check(account, wallet, positions, secret, log=print):
             # Owner 2026-11-10: Base44 alerts are switched off (margin messages
             # cost credits the owner asked us to stop spending). Log locally
             # only; margin relief acts automatically at 90%.
-            r = None  # posting disabled (owner 2026-11-10)
-            if False:
-              r = requests.post(BASE44_ALERT_URL, json={
-                'secret': secret or '', 'account': str(account), 'kind': 'margin_70',
-                'used_pct': round(pct, 2), 'wallet': round(float(wallet or 0), 2),
-                'margin_used': round(used, 2), 'detail': detail[:500]}, timeout=20)
-            if getattr(r, 'status_code', 0) != 200:
-                raise RuntimeError('HTTP %s: %s' % (r.status_code, r.text[:80]))
+            # Posting to Base44 is disabled (owner 2026-11-10, credit cut):
+            # the alert is recorded locally only and never leaves the VM.
+            log('ALERT MARGIN-70 %s: used %.1f%% of wallet (local only, no Base44 post)' % (
+                account, pct))
         except Exception as e:
             _state['fired'].discard(account)
             log('ERROR margin-alert post failed for %s: %s: %s' % (account, type(e).__name__, str(e)[:80]))

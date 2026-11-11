@@ -314,8 +314,10 @@ def _save_remaining_cache():
 # Falls back to a direct fetch whenever the cache is down, stale or disabled,
 # so no engine can ever be blocked by it.
 # ---------------------------------------------------------------------------
-_ACCESS = {'token': None, 'ts': 0.0}
-_ACCESS_TTL = 2700  # Involio access tokens last well under an hour
+_ACCESS = {}          # refresh_token -> (access_token, fetched_at)
+_META = {}            # portfolio_id -> (portfolio metadata, fetched_at)
+_META_TTL = 1800      # portfolio type/metadata barely changes
+_ACCESS_TTL = 600     # Involio access tokens expire around 20 minutes
 
 
 def _cache_url():
@@ -336,18 +338,22 @@ def _book_cache_get(profile):
     return None
 
 
-def _cached_access(session, refresh_token):
+def _invalidate(refresh_token):
+    _ACCESS.pop(refresh_token, None)
+
+
+def _cached_access(session, refresh_token, force=False):
     now = time.time()
-    if _ACCESS['token'] and (now - _ACCESS['ts']) < _ACCESS_TTL:
-        return _ACCESS['token']
+    hit = _ACCESS.get(refresh_token)
+    if hit and not force and (now - hit[1]) < _ACCESS_TTL:
+        return hit[0]
     response = session.get(BASE + '/v1_0/auth/refresh_token',
                            headers={'Authorization': 'Bearer ' + refresh_token}, timeout=25)
     response.raise_for_status()
     access = response.json().get('accessToken')
     if not access:
         raise SourceDataError('Involio refresh did not return access token')
-    _ACCESS['token'] = access
-    _ACCESS['ts'] = now
+    _ACCESS[refresh_token] = (access, now)
     return access
 
 
@@ -371,6 +377,10 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
         if value.get('success') is not True or value.get('error'):
             raise SourceDataError('Source API failed for '+path)
         return value
+    def reauth():
+        _invalidate(token)
+        session.headers['Authorization'] = 'Bearer ' + _cached_access(session, token, force=True)
+
     def post_retry(path,data,attempts=3):
         # Owner 2026-10-28: Involio endpoints flap with transient 500s/null pages
         # during partial outages; a short retry window keeps the engine alive
@@ -381,9 +391,21 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
                 return post(path,data)
             except Exception as e:
                 last=e
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                if code in (401, 403):
+                    try:
+                        reauth()
+                        return post(path,data)
+                    except Exception as e2:
+                        last = e2
                 if a<attempts-1: time.sleep(1.5*(a+1))
         raise last
-    metadata=post_retry('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+    hit=_META.get(portfolio_id)
+    if hit and (time.time()-hit[1])<_META_TTL:
+        metadata=hit[0]
+    else:
+        metadata=post_retry('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+        _META[portfolio_id]=(metadata,time.time())
     if (metadata.get('portfolio') or {}).get('type') == 'live':
         return fetch_dex_book(session, profile, portfolio_id, metadata.get('portfolio'))
     positions=[]
