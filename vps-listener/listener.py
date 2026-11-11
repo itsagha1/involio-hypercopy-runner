@@ -2288,6 +2288,7 @@ def selfcheck_fix(x_signature: str = Header(default="")):
         positions that are neither mirrored nor manual so nothing is orphaned.
     Returns a plain summary the app can show to the owner.
     """
+    secret = get_shared_secret()
     if not _sig_ok(x_signature or ""):
         raise HTTPException(403, "bad signature")
 
