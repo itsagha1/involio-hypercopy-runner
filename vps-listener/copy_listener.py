@@ -237,6 +237,24 @@ def _reasons(key, why):
 
 # ---------------------------------------------------------------- entry
 
+
+
+def request_add_fund(account, needed):
+    """Owner 2026-11-11: an add could not be paid for out of free margin.
+    Ask the margin-relief service for a top-up instead of silently dropping
+    the size increase (dropped adds are what pushed our average entry above
+    the source's and turned his take-profit into our loss)."""
+    try:
+        d = "/var/lib/hypercopy-copy/add_fund_requests"
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "%s.tmp" % account)
+        with open(tmp, "w") as f:
+            json.dump({"account": account, "needed": round(float(needed), 2),
+                       "reason": "size_add", "at": time.time()}, f)
+        os.replace(tmp, os.path.join(d, "%s.json" % account))
+    except Exception:
+        pass
+
 def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
     key, bk = tkey(p), bybit_key(p)
     coin, side = p["ticker"], str(p["side"]).lower()
@@ -253,7 +271,7 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
     roi = source_roi(p)
     if roi is not None and roi >= PROFIT_SKIP_ROI:
         state["skip_watch"][key] = {"roi": roi, "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        return f"SKIP-WATCH {key} new_entry: source ROI +{roi*100:.2f}% >= +2%; watching for ROI drop below 2%", None
+        return f"SKIP-WATCH {key} new_entry: source ROI +{roi*100:.2f}% >= +3%; watching for ROI drop below 3%", None
 
     try:
         try:
@@ -413,6 +431,7 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
             lev = int(rec.get("leverage") or 1) or 1
             if delta * float(client.get_ticker(symbol)["lastPrice"]) / lev > avail * MAX_AVAIL_PER_TRADE:
                 rec["desired_source_qty"] = curr_sq
+                request_add_fund(COPY_NAME, 100.0)
                 return f"SKIP {key} size_add: insufficient available balance - target kept for retry"
             place_order_mode_safe(client, symbol, bybit_side(side), delta, position_idx=idx,
                                order_link_id=order_link(key, "add", int(rec.get("gen", 0))))

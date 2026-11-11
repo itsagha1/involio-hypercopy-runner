@@ -626,6 +626,24 @@ def next_open_link(client, key, symbol, qty, state):
 def order_link(key,operation,generation=0):
     return "BC"+hashlib.sha256((key+"|"+operation+"|"+str(generation)).encode()).hexdigest()[:32]
 
+
+
+def request_add_fund(account, needed):
+    """Owner 2026-11-11: an add could not be paid for out of free margin.
+    Ask the margin-relief service for a top-up instead of silently dropping
+    the size increase (dropped adds are what pushed our average entry above
+    the source's and turned his take-profit into our loss)."""
+    try:
+        d = "/var/lib/hypercopy-copy/add_fund_requests"
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "%s.tmp" % account)
+        with open(tmp, "w") as f:
+            json.dump({"account": account, "needed": round(float(needed), 2),
+                       "reason": "size_add", "at": time.time()}, f)
+        os.replace(tmp, os.path.join(d, "%s.json" % account))
+    except Exception:
+        pass
+
 def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: Dict[str, Any], state: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Open 1:1 percentage margin allocation mirror for sole source booobsas."""
     trader_norm = normalize_trader(trader)
@@ -856,6 +874,7 @@ def sync_size(client: BybitClient, trader: str, p: Dict[str, Any], rec: Dict[str
             avail = float(client.get_available_balance() or 0)
 
             if need_margin > budget or need_margin > avail or dqty * price < MIN_NOTIONAL:
+                request_add_fund("main", need_margin - min(budget, avail))
                 rec["desired_source_qty"] = curr_sq
                 return (f"SKIP {key} size_add: add margin ({need_margin:.2f} USDT) "
                         f"exceeds budget ({budget:.2f} USDT) / available balance - target {curr_sq} kept for retry")

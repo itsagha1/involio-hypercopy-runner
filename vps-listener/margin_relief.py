@@ -11,7 +11,8 @@ OWNER RULE (2026-11-07):
 Safety: per-account cooldown, hard cap on outstanding relief, never borrows more
 than the master actually holds, dry-run by default (MARGIN_RELIEF_DRY_RUN=1).
 """
-import json, os, sys, time
+import json
+import os, os, sys, time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +25,8 @@ REPAY_PCT = 30.0
 MIN_AMOUNT = 100.0
 MAX_AMOUNT = 200.0
 MAX_OUTSTANDING = 600.0
+MASTER_MAX_PCT = 60
+ADD_COOLDOWN_SECONDS = 3600   # at most one add-top-up per account per hour
 COOLDOWN_SECONDS = 600
 STATE_FILE = '/var/lib/hypercopy-copy/margin_relief.json'
 LOG_FILE = '/var/lib/hypercopy-copy/margin_relief.log'
@@ -81,10 +84,89 @@ def master_balance():
         return 0.0
 
 
+
+REQ_DIR = '/var/lib/hypercopy-copy/add_fund_requests'
+
+
+def _master_unified():
+    """(wallet, available, margin_pct) of the master UNIFIED account."""
+    try:
+        c = mf.client_for('master')
+        u = c._get('/v5/account/wallet-balance',
+                   {'accountType': 'UNIFIED', 'coin': 'USDT'})
+        acc = (u.get('list') or [{}])[0]
+        w = (acc.get('coin') or [{}])[0]
+        wallet = float(w.get('walletBalance') or 0)
+        avail = float(w.get('availableToWithdraw') or w.get('walletBalance') or 0)
+        summ = c.get_account_summary() or {}
+        pct = float(summ.get('margin_pct') or 0)
+        return wallet, avail, pct
+    except Exception as e:
+        log('ERROR reading master UNIFIED: %s' % str(e)[:90])
+        return 0.0, 0.0, 0.0
+
+
+def top_up_pool(needed):
+    """Move USDT from the master UNIFIED wallet into its FUND wallet so a
+    transfer to a sub-account is possible. Never lets the master's own margin
+    climb past MASTER_MAX_PCT."""
+    if needed <= 0:
+        return 0.0
+    wallet, avail, pct = _master_unified()
+    if wallet <= 0:
+        return 0.0
+    # headroom keeping the master under MASTER_MAX_PCT margin
+    used = wallet * (pct / 100.0)
+    room = (used / (MASTER_MAX_PCT / 100.0)) - wallet if pct > 0 else avail
+    amount = round(min(needed, avail, max(0.0, room), MAX_AMOUNT), 2)
+    if amount < 1:
+        log('pool top-up refused: available %.2f, keeping master under %.0f%% (margin %.1f%%)'
+            % (avail, MASTER_MAX_PCT, pct))
+        return 0.0
+    log('pool top-up: moving %.2f USDT from master UNIFIED (margin %.1f%%) to FUND' % (amount, pct))
+    if not DRY_RUN:
+        try:
+            r = mf.client_for('master')._post('/v5/asset/transfer/inter-transfer', {
+                'transferId': 'topup-' + str(int(time.time())),
+                'coin': 'USDT', 'amount': str(amount),
+                'fromAccountType': 'UNIFIED', 'toAccountType': 'FUND'})
+            if str((r or {}).get('retCode', 0)) not in ('0', 'None'):
+                log('pool top-up FAILED: %s' % json.dumps(r)[:120])
+                return 0.0
+        except Exception as e:
+            log('pool top-up FAILED: %s' % str(e)[:110])
+            return 0.0
+    return amount
+
+
+def pending_add_funds():
+    """Adds the engines could not fund, one file per account."""
+    out = {}
+    try:
+        for f in os.listdir(REQ_DIR):
+            if not f.endswith('.json'):
+                continue
+            path = os.path.join(REQ_DIR, f)
+            try:
+                req = json.load(open(path))
+                acct = str(req.get('account') or f.replace('.json', ''))
+                out[acct] = max(float(req.get('needed') or 0), out.get(acct, 0.0))
+                os.unlink(path)
+            except Exception:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 def main():
     state = load_state()
     now = time.time()
     mbal = master_balance()
+    pending = pending_add_funds()
     changed = False
     if abs(float(state.get('master_pool_usd') or 0) - mbal) > 0.005:
         state['master_pool_usd'] = round(mbal, 2)
@@ -131,6 +213,31 @@ def main():
                     log('%s: repayment FAILED %s' % (name, str(e)[:100]))
             continue
 
+        # --- add funding: a size increase could not be paid for ---
+        wanted = pending.get(key) or pending.get(name)
+        if wanted and (now - float(st.get('last_add_fund_ts') or 0)) >= ADD_COOLDOWN_SECONDS \
+                and out + 1 <= MAX_OUTSTANDING:
+            need = round(min(max(MIN_AMOUNT, wanted), MAX_AMOUNT), 2)
+            if mbal < need:
+                mbal += top_up_pool(need - mbal)
+            if mbal >= need:
+                log('%s: add needs %.2f USDT -> funding from master (margin %.1f%%, wallet %.2f)'
+                    % (name, need, pct, wallet))
+                if not DRY_RUN:
+                    try:
+                        res = mf.transfer('master', key, need, execute=True)
+                        if (res or {}).get('status') == 'SUCCESS':
+                            st['outstanding'] = round(out + need, 2)
+                            st['last_add_fund_ts'] = now
+                            changed = True
+                            mbal = master_balance()
+                        else:
+                            log('%s: add funding not confirmed: %s' % (name, json.dumps(res)[:110]))
+                    except Exception as e:
+                        log('%s: add funding FAILED %s' % (name, str(e)[:100]))
+                continue
+            log('%s: add needs %.2f USDT but master has %.2f - cannot fund' % (name, need, mbal))
+
         # --- relief: margin has run up to the trigger ---
         if pct >= TRIGGER_PCT and out < MAX_OUTSTANDING and since >= COOLDOWN_SECONDS:
             needed = round(used / (TARGET_PCT / 100.0) - wallet, 2)
@@ -139,13 +246,15 @@ def main():
             if amount < 1:
                 continue
             if mbal < amount:
+                mbal += top_up_pool(amount - mbal)
+            if mbal < amount:
                 log('%s: margin %.1f%% >= %.0f%% but master holds only %.2f USDT (need %.2f) - cannot fund' % (name, pct, TRIGGER_PCT, mbal, amount))
                 st['last_action_ts'] = now
                 continue
             log('%s: margin %.1f%% >= %.0f%% -> borrowing %.2f USDT from master (wallet %.2f, needed %.2f for %.0f%%)' % (name, pct, TRIGGER_PCT, amount, wallet, needed, TARGET_PCT))
             if not DRY_RUN:
                 try:
-                    res = mf.transfer('master', name, amount, execute=True)
+                    res = mf.transfer('master', key, amount, execute=True)
                     if (res or {}).get('status') != 'SUCCESS':
                         log('%s: relief not confirmed: %s' % (name, json.dumps(res)[:120]))
                         continue
