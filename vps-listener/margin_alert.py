@@ -47,6 +47,7 @@ def check(account, wallet, positions, secret, log=print):
             # Owner 2026-11-10: Base44 alerts are switched off (margin messages
             # cost credits the owner asked us to stop spending). Log locally
             # only; margin relief acts automatically at 90%.
+            r = None  # posting disabled (owner 2026-11-10)
             if False:
               r = requests.post(BASE44_ALERT_URL, json={
                 'secret': secret or '', 'account': str(account), 'kind': 'margin_70',

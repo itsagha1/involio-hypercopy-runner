@@ -80,7 +80,7 @@ STATE_FILE = os.environ.get("COPY_STATE_FILE", f"/var/lib/hypercopy-copy/{NAME}_
 LOG_FILE = os.environ.get("COPY_LOG_FILE", f"/var/lib/hypercopy-copy/{NAME}_actions.log")
 STATE_LOCK = __import__("threading").Lock()
 
-PROFIT_SKIP_ROI = 0.02          # 2% profit-skip threshold (owner 2026-10-12)
+PROFIT_SKIP_ROI = 0.03          # 2% profit-skip threshold (owner 2026-10-12)
 FEE_ALLOWANCE = 0.0012      # 0.12% roundtrip fee allowance for source-lost breakeven math
 TP_TRIGGER_OFFSET = 0.005  # +0.5% beyond fee-adjusted breakeven for the retained TP trigger
 TRAILING_DIST_PCT = 0.005  # 0.5% price trailing distance (same rule as the main listener)

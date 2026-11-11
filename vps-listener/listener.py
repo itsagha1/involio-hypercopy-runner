@@ -47,7 +47,7 @@ LISTENER_VERSION = "v3.7.4"
 SOLE_SOURCE_PROFILE = "booobsas"  # Primary profile retained for compatibility.
 AUTHORIZED_PROFILES = {"booobsas", "akira", "oozypath", "_k2_", "johndrockefeller"}
 
-PROFIT_SKIP_ROI = 0.02            # owner rule 2026-10-13: skip new trades already >= +2% source ROI on margin, with auto re-entry watch below 2%
+PROFIT_SKIP_ROI = 0.03            # owner rule 2026-11-11: skip new trades already >= +3% source ROI on margin (was 2%), auto re-entry watch below 3%
 MIN_NOTIONAL = 5.0                # Bybit linear minimum order notional (USDT)
 MARGIN_CAP = 1.0                  # owner budget: FULL current wallet balance (1.0)
 FEE_BUFFER = 0.0012               # 0.12% roundtrip fee allowance for breakeven activation
@@ -671,8 +671,8 @@ def open_mirror(client: BybitClient, trader: str, p: Dict[str, Any], book_info: 
     if s_roi is not None and s_roi >= PROFIT_SKIP_ROI:
         state.setdefault("skip_watch", {})[key] = {
             "roi": s_roi, "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        return (f"SKIP-WATCH {key} new_entry: source ROI +{s_roi * 100:.1f}% >= +2%; "
-                f"watching for ROI drop below 2% (auto re-entry)"), None
+        return (f"SKIP-WATCH {key} new_entry: source ROI +{s_roi * 100:.1f}% >= +{PROFIT_SKIP_ROI * 100:.0f}%; "
+                f"watching for ROI drop below {PROFIT_SKIP_ROI * 100:.0f}% (auto re-entry)"), None
 
     try:
         # Instrument status check (must be Trading, e.g. skip FETClosed)
@@ -2087,7 +2087,7 @@ def _main_self_poll_loop():
                 log_action(f"LOG source health check failed: {str(_e)[:80]}")
         except Exception:
             pass
-        time.sleep(30)
+        time.sleep(20)
 
 threading.Thread(target=_main_self_poll_loop, daemon=True, name="main-self-poll").start()
 
