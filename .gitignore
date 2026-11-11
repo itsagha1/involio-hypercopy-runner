@@ -1,3 +1,9 @@
-last_state.json
+.env
+.env.*
+*.log
+*.jsonl
+venv/
 __pycache__/
-*.pyc
+Stage
+*.bak
+*.backup.*
