@@ -25,7 +25,6 @@ REPAY_PCT = 30.0
 MIN_AMOUNT = 100.0
 MAX_AMOUNT = 200.0
 MAX_OUTSTANDING = 600.0
-MASTER_MAX_PCT = 60
 ADD_COOLDOWN_SECONDS = 3600   # at most one add-top-up per account per hour
 COOLDOWN_SECONDS = 600
 STATE_FILE = '/var/lib/hypercopy-copy/margin_relief.json'
@@ -86,57 +85,6 @@ def master_balance():
 
 
 REQ_DIR = '/var/lib/hypercopy-copy/add_fund_requests'
-
-
-def _master_unified():
-    """(wallet, available, margin_pct) of the master UNIFIED account."""
-    try:
-        c = mf.client_for('master')
-        u = c._get('/v5/account/wallet-balance',
-                   {'accountType': 'UNIFIED', 'coin': 'USDT'})
-        acc = (u.get('list') or [{}])[0]
-        w = (acc.get('coin') or [{}])[0]
-        wallet = float(w.get('walletBalance') or 0)
-        avail = float(w.get('availableToWithdraw') or w.get('walletBalance') or 0)
-        summ = c.get_account_summary() or {}
-        pct = float(summ.get('margin_pct') or 0)
-        return wallet, avail, pct
-    except Exception as e:
-        log('ERROR reading master UNIFIED: %s' % str(e)[:90])
-        return 0.0, 0.0, 0.0
-
-
-def top_up_pool(needed):
-    """Move USDT from the master UNIFIED wallet into its FUND wallet so a
-    transfer to a sub-account is possible. Never lets the master's own margin
-    climb past MASTER_MAX_PCT."""
-    if needed <= 0:
-        return 0.0
-    wallet, avail, pct = _master_unified()
-    if wallet <= 0:
-        return 0.0
-    # headroom keeping the master under MASTER_MAX_PCT margin
-    used = wallet * (pct / 100.0)
-    room = (used / (MASTER_MAX_PCT / 100.0)) - wallet if pct > 0 else avail
-    amount = round(min(needed, avail, max(0.0, room), MAX_AMOUNT), 2)
-    if amount < 1:
-        log('pool top-up refused: available %.2f, keeping master under %.0f%% (margin %.1f%%)'
-            % (avail, MASTER_MAX_PCT, pct))
-        return 0.0
-    log('pool top-up: moving %.2f USDT from master UNIFIED (margin %.1f%%) to FUND' % (amount, pct))
-    if not DRY_RUN:
-        try:
-            r = mf.client_for('master')._post('/v5/asset/transfer/inter-transfer', {
-                'transferId': 'topup-' + str(int(time.time())),
-                'coin': 'USDT', 'amount': str(amount),
-                'fromAccountType': 'UNIFIED', 'toAccountType': 'FUND'})
-            if str((r or {}).get('retCode', 0)) not in ('0', 'None'):
-                log('pool top-up FAILED: %s' % json.dumps(r)[:120])
-                return 0.0
-        except Exception as e:
-            log('pool top-up FAILED: %s' % str(e)[:110])
-            return 0.0
-    return amount
 
 
 def pending_add_funds():
@@ -218,8 +166,6 @@ def main():
         if wanted and (now - float(st.get('last_add_fund_ts') or 0)) >= ADD_COOLDOWN_SECONDS \
                 and out + 1 <= MAX_OUTSTANDING:
             need = round(min(max(MIN_AMOUNT, wanted), MAX_AMOUNT), 2)
-            if mbal < need:
-                mbal += top_up_pool(need - mbal)
             if mbal >= need:
                 log('%s: add needs %.2f USDT -> funding from master (margin %.1f%%, wallet %.2f)'
                     % (name, need, pct, wallet))
@@ -245,8 +191,6 @@ def main():
             amount = round(min(amount, MAX_OUTSTANDING - out), 2)
             if amount < 1:
                 continue
-            if mbal < amount:
-                mbal += top_up_pool(amount - mbal)
             if mbal < amount:
                 log('%s: margin %.1f%% >= %.0f%% but master holds only %.2f USDT (need %.2f) - cannot fund' % (name, pct, TRIGGER_PCT, mbal, amount))
                 st['last_action_ts'] = now
