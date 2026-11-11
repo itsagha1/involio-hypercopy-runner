@@ -461,11 +461,47 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
         return f"{'SKIP' if 'too small' in str(e) else 'ERROR'} {key} sync_size: {e}"
 
 
+
+FEE_BUFFER = 0.0012
+
+
+def _safe_copy_targets(client, rec, sl, tp):
+    """Owner 2026-11-11: same guard the main account has had since the WLD loss.
+    A source take-profit can sit on the losing side of OUR fill when our average
+    entry is worse than the source's (blocked adds). Copying that number turns a
+    profit target into a guaranteed loss order, so it is clamped to
+    breakeven+fees and never placed beyond the live price."""
+    side = rec.get("side")
+    entry = 0.0
+    try:
+        for pos in client.get_positions(rec["symbol"]):
+            if float(pos.get("size") or 0) > 0:
+                entry = float(pos.get("avgPrice") or 0)
+                break
+    except Exception:
+        entry = 0.0
+    if not entry:
+        try:
+            qty = float(rec.get("qty") or 0)
+            if qty:
+                entry = float(rec.get("notional") or 0) / qty
+        except Exception:
+            entry = 0.0
+    if entry and tp:
+        try:
+            be = entry * (1 + FEE_BUFFER) if side == "long" else entry * (1 - FEE_BUFFER)
+            tp = max(float(tp), be) if side == "long" else min(float(tp), be)
+        except Exception:
+            pass
+    return sl, tp
+
+
 def sync_sltp(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Optional[str]:
     key = tkey(p)
     sl, tp = p.get("stop_loss"), p.get("price_target")
     if rec.get("stop_loss") == sl and rec.get("price_target") == tp and not rec.get("sltp_pending"):
         return None
+    sl, tp = _safe_copy_targets(client, rec, sl, tp)
     try:
         price = float(client.get_ticker(rec["symbol"])["lastPrice"])
         if sl and ((rec["side"] == "long" and float(sl) >= price) or (rec["side"] == "short" and float(sl) <= price)):
