@@ -370,7 +370,11 @@ def open_mirror(client: BybitClient, p: Dict[str, Any], state: Dict[str, Any]) -
 
         if p.get("stop_loss") or p.get("price_target"):
             try:
-                client.set_sl_tp(symbol, p.get("stop_loss"), p.get("price_target"),
+                # SAFE-TP at the moment of opening too, not only on later syncs
+                _sl, _tp = _safe_copy_targets(client, rec, p.get("stop_loss"), p.get("price_target"))
+                rec["price_target"] = _tp
+                rec["stop_loss"] = _sl
+                client.set_sl_tp(symbol, _sl, _tp,
                                 position_idx=position_idx(symbol, side))
             except BybitError as e:
                 rec["sltp_pending"] = True
