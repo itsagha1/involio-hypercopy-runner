@@ -2214,7 +2214,7 @@ def _fleet_warm_loop():
             _FLEET_CACHE["ts"] = time.time()
         except Exception:
             pass
-        time.sleep(30)
+        time.sleep(20)
 
 threading.Thread(target=_fleet_warm_loop, daemon=True, name="fleet-warm").start()
 

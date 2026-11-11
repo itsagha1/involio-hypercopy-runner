@@ -1,3 +1,5 @@
+import time
+import os
 """Read-only Involio adapter. All credentials stay in the VPS environment."""
 from datetime import datetime, timezone
 import json, math, os, time, requests
@@ -303,19 +305,65 @@ def _save_remaining_cache():
     except Exception:
         pass
 
+
+# ---------------------------------------------------------------------------
+# Owner 2026-11-11: shared book cache.
+# Six engines each logged into Involio and pulled every portfolio themselves.
+# At a 30s poll that tripped HTTP 429 and stalled every engine. A single
+# book-cache daemon now pulls each book once; engines read it from here.
+# Falls back to a direct fetch whenever the cache is down, stale or disabled,
+# so no engine can ever be blocked by it.
+# ---------------------------------------------------------------------------
+_ACCESS = {'token': None, 'ts': 0.0}
+_ACCESS_TTL = 2700  # Involio access tokens last well under an hour
+
+
+def _cache_url():
+    return os.environ.get('BOOK_CACHE_URL', 'http://127.0.0.1:8010')
+
+
+def _book_cache_get(profile):
+    if os.environ.get('BOOK_CACHE_DISABLE') == '1':
+        return None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(_cache_url() + '/book?profile=' + str(profile), timeout=4) as r:
+            payload = json.loads(r.read().decode())
+        if payload.get('ok'):
+            return payload.get('book')
+    except Exception:
+        return None
+    return None
+
+
+def _cached_access(session, refresh_token):
+    now = time.time()
+    if _ACCESS['token'] and (now - _ACCESS['ts']) < _ACCESS_TTL:
+        return _ACCESS['token']
+    response = session.get(BASE + '/v1_0/auth/refresh_token',
+                           headers={'Authorization': 'Bearer ' + refresh_token}, timeout=25)
+    response.raise_for_status()
+    access = response.json().get('accessToken')
+    if not access:
+        raise SourceDataError('Involio refresh did not return access token')
+    _ACCESS['token'] = access
+    _ACCESS['ts'] = now
+    return access
+
+
 def fetch_source_book(profile=PROFILE, portfolio_id=None):
 
     if portfolio_id is None:
         if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
         portfolio_id=PROFILES[profile]
+    cached=_book_cache_get(profile)
+    if cached is not None:
+        return cached
     token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
     session=FailoverSession()
     session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
-    response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
-    response.raise_for_status()
-    access=response.json().get('accessToken')
-    if not access: raise SourceDataError('Involio refresh did not return access token')
+    access=_cached_access(session,token)
     session.headers['Authorization']='Bearer '+access
     def post(path,data):
         response=session.post(BASE+path,json=data,timeout=25)
