@@ -44,7 +44,11 @@ def check(account, wallet, positions, secret, log=print):
                                   for p in (positions or [])
                                   if _safe_size(p) > 0)[:12])
         try:
-            r = requests.post(BASE44_ALERT_URL, json={
+            # Owner 2026-11-10: Base44 alerts are switched off (margin messages
+            # cost credits the owner asked us to stop spending). Log locally
+            # only; margin relief acts automatically at 90%.
+            if False:
+              r = requests.post(BASE44_ALERT_URL, json={
                 'secret': secret or '', 'account': str(account), 'kind': 'margin_70',
                 'used_pct': round(pct, 2), 'wallet': round(float(wallet or 0), 2),
                 'margin_used': round(used, 2), 'detail': detail[:500]}, timeout=20)

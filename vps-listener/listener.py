@@ -1837,7 +1837,14 @@ def main_mirror_stats(mirrored):
         _MAIN_MIRROR_STATS["data"] = data
         _MAIN_MIRROR_STATS["ts"] = _t.time()
         return data
-    except Exception:
+    except Exception as _e:
+        import traceback as _tb
+        log_action("STATS-FAIL %s: %s" % (type(_e).__name__, str(_e)[:120]))
+        try:
+            with open("/var/lib/hypercopy-copy/stats_error.log", "a") as _f:
+                _f.write(_tb.format_exc()[-1500:] + "\n")
+        except Exception:
+            pass
         return _MAIN_MIRROR_STATS["data"] or {"profiles": {}, "cumulative_pnl": None}
 
 _LAST_GOOD_ACCOUNTS: Dict[str, Any] = {}
