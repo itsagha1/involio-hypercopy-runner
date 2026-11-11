@@ -146,7 +146,7 @@ def check_owner(profile, portfolio_id, portfolio):
     raise SourceDataError('Wrong source owner')
 
 
-def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None):
+def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None, meta_is_stale=False):
     # owner 2026-10-16: profile may be comma-separated (multi-owner subaccount,
     # e.g. bluespire,b4451). Every name must be registered; the portfolio's
     # owner username must be one of them.
@@ -165,6 +165,12 @@ def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=No
         raise SourceDataError('Incomplete source sim data')
     expected = int(portfolio.get('openPositions', -1))
     if expected != len(raw_positions) or len(sims['investments']) != len(raw_positions):
+        if meta_is_stale:
+            # owner 2026-11-12: cached meta's openPositions can be stale when the
+            # source trader changed positions mid-TTL. Tag it; the public wrapper
+            # retries once with fresh metadata. With fresh meta this strict check
+            # still guards against truncated position lists.
+            raise SourceDataError('STALE-META counts disagree; not safe to infer closures')
         raise SourceDataError('Source snapshot counts disagree; not safe to infer closures')
     sim_by_id = {str(x.get('baseId')): x for x in sims['investments']}
     if len(sim_by_id) != len(sims['investments']):
@@ -358,6 +364,20 @@ def _cached_access(session, refresh_token, force=False):
 
 
 def fetch_source_book(profile=PROFILE, portfolio_id=None):
+    # owner 2026-11-12: retry-once wrapper. A count disagreement caused by
+    # stale cached metadata is retried with a fresh metadata fetch; a
+    # disagreement against fresh metadata is a genuine data problem and
+    # still refuses the book (never infer closures from an unverified
+    # snapshot).
+    try:
+        return _fetch_source_book_impl(profile, portfolio_id)
+    except SourceDataError as e:
+        if 'STALE-META' in str(e):
+            return _fetch_source_book_impl(profile, portfolio_id, fresh_meta=True)
+        raise
+
+
+def _fetch_source_book_impl(profile=PROFILE, portfolio_id=None, fresh_meta=False):
 
     if portfolio_id is None:
         if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
@@ -400,10 +420,13 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
                         last = e2
                 if a<attempts-1: time.sleep(1.5*(a+1))
         raise last
-    hit=_META.get(portfolio_id)
-    if hit and (time.time()-hit[1])<_META_TTL:
-        metadata=hit[0]
-    else:
+    meta_from_cache=False
+    if not fresh_meta:
+        hit=_META.get(portfolio_id)
+        if hit and (time.time()-hit[1])<_META_TTL:
+            metadata=hit[0]
+            meta_from_cache=True
+    if not meta_from_cache:
         metadata=post_retry('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
         _META[portfolio_id]=(metadata,time.time())
     if (metadata.get('portfolio') or {}).get('type') == 'live':
@@ -453,7 +476,7 @@ def fetch_source_book(profile=PROFILE, portfolio_id=None):
                 raise SourceDataError('sims degraded and position math failed')
         sims={'success':True,'degraded':True,'investments':approx,
               'portfolioRemainingSim':remaining}
-    book=normalize_source(metadata,positions,sims,profile,portfolio_id)
+    book=normalize_source(metadata,positions,sims,profile,portfolio_id,meta_is_stale=meta_from_cache)
     book['sims_degraded']=bool(sims.get('degraded'))
     return book
 
