@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Shared source-book cache with priority tiers (owner 2026-11-12).
+"""Shared source-book cache, two Involio accounts, priority tiers.
 
-One process logs into Involio once per cycle and pulls each source portfolio
-once; every engine reads the result on 127.0.0.1:8010 instead of fetching its
-own copy.
+Owner 2026-11-12: supports a SECOND Involio account. Each token has its own
+worker and its own pacing, so the two accounts fetch in parallel and the
+profiles are split between them. A throttle on one token no longer stalls the
+whole fleet, which is what produced the 429 storms with a single account.
 
-Tiers: a profile we actually hold a position in is HOT (refreshed about every
-25s); a profile with no open mirror is COLD (every 4 minutes). This keeps the
-books that decide something fresh without exceeding Involio's request budget,
-which is what produced the 429 storms when everything refreshed at one rate.
-
-Read-only: it never places, changes or closes anything.
+Tiers: profiles we hold positions in are HOT (target ~25s); the rest are COLD
+(every 4 minutes). Read-only: never places, changes or closes anything.
 """
 import json
 import os
@@ -23,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["BOOK_CACHE_DISABLE"] = "1"   # never read our own cache
+os.environ["BOOK_CACHE_DISABLE"] = "1"
 
 import source_api  # noqa: E402
 
@@ -31,21 +28,18 @@ PORT = int(os.environ.get("BOOK_CACHE_PORT", "8010"))
 MAX_AGE = float(os.environ.get("BOOK_CACHE_MAX_AGE", "400"))
 HOT_INTERVAL = float(os.environ.get("BOOK_CACHE_HOT", "25"))
 COLD_INTERVAL = float(os.environ.get("BOOK_CACHE_COLD", "240"))
-PACE = float(os.environ.get("BOOK_CACHE_PACING", "1.6"))
-COOLDOWN = float(os.environ.get("BOOK_CACHE_COOLDOWN", "300"))
+PACE_FLOOR = float(os.environ.get("BOOK_CACHE_PACING", "1.2"))
+COOLDOWN = float(os.environ.get("BOOK_CACHE_COOLDOWN", "180"))
 UNITS = "/etc/systemd/system"
+TOKEN2_FILE = "/etc/involio-token2.env"
 ENGINE_PORTS = [8000, 8001, 8002, 8003, 8004, 8005, 8006]
 
-CACHE = {}
-DUE = {}
-COOLDOWN_UNTIL = {}
-HOT = set()
+CACHE, DUE, COOLDOWN_UNTIL, HOT = {}, {}, {}, set()
 LOCK = threading.Lock()
-STATS = {"cycles": 0, "fetches": 0, "errors": 0, "last_cycle": 0, "hot": 0, "cold": 0, "pace": PACE}
+STATS = {"fetches": 0, "errors": 0, "hot": 0, "tokens": 0}
 
 
 def groups():
-    """profile/portfolio list per env file, straight from the engine units."""
     out, seen = [], set()
     try:
         for name in sorted(os.listdir(UNITS)):
@@ -63,20 +57,19 @@ def groups():
             if pairs and key not in seen:
                 seen.add(key)
                 out.append((envf.group(1), pairs))
-        main_env = "/home/ubuntu/involio-hypercopy-runner/vps-listener/.env"
         main_pairs = [(p, pid) for p, pid in getattr(source_api, "PROFILES", {}).items()]
         key = tuple(main_pairs)
         if main_pairs and key not in seen:
-            out.append((main_env, main_pairs))
+            out.append(("/home/ubuntu/involio-hypercopy-runner/vps-listener/.env", main_pairs))
     except Exception as e:
         print("group discovery failed:", e, flush=True)
     return out
 
 
-def token_from(path):
+def token_from(path, name="INVOLIO_REFRESH_TOKEN"):
     try:
         for line in open(path):
-            if line.startswith("INVOLIO_REFRESH_TOKEN="):
+            if line.startswith(name + "="):
                 return line.split("=", 1)[1].strip()
     except OSError:
         pass
@@ -84,7 +77,6 @@ def token_from(path):
 
 
 def refresh_hot_set():
-    """Profiles we hold a position in are the ones worth refreshing often."""
     hot = set()
     for port in ENGINE_PORTS:
         try:
@@ -96,62 +88,49 @@ def refresh_hot_set():
             prof = str(key).split("|")[0]
             if prof:
                 hot.add(prof)
-        for pos in (d.get("bybit") or {}).get("positions") or []:
-            pass
     with LOCK:
-        changed = hot != HOT
         HOT.clear()
         HOT.update(hot)
         STATS["hot"] = len(HOT)
-    if changed:
-        print("hot set (%d): %s" % (len(hot), ",".join(sorted(hot))[:160]), flush=True)
 
 
-def fetch_one(profile, pid, env_path, tok):
-    global PACE
-    try:
-        if COOLDOWN_UNTIL.get(profile, 0) > time.time():
-            return False
-        os.environ["INVOLIO_REFRESH_TOKEN"] = tok
-        time.sleep(PACE)
-        book = source_api.fetch_source_book(profile=profile, portfolio_id=pid)
-        with LOCK:
-            CACHE[profile] = {"book": book, "ts": time.time(), "error": None}
-        STATS["fetches"] += 1
-        return True
-    except Exception as e:
-        msg = str(e)[:140]
-        with LOCK:
-            prev = CACHE.get(profile) or {}
-            CACHE[profile] = {"book": prev.get("book"), "ts": prev.get("ts"),
-                              "error": msg, "err_ts": time.time()}
-        STATS["errors"] += 1
-        if "429" in msg:
-            COOLDOWN_UNTIL[profile] = time.time() + COOLDOWN
-            PACE = min(PACE * 1.3, 5.0)
-            STATS["pace"] = round(PACE, 2)
-        return False
-
-
-def scheduler():
-    """Fetch whatever is due, hot first. Never bursts: one call at a time."""
-    global PACE
-    now = time.time()
-    with LOCK:
-        due = [(prof, pid, env, tok) for (prof, pid, env, tok) in JOBS
-               if now >= DUE.get(prof, 0)]
-    hot_due = [j for j in due if j[0] in HOT]
-    cold_due = [j for j in due if j[0] not in HOT]
-    ordered = hot_due + cold_due
-    for prof, pid, env, tok in ordered:
-        ok = fetch_one(prof, pid, env, tok)
-        interval = HOT_INTERVAL if prof in HOT else COLD_INTERVAL
-        with LOCK:
-            DUE[prof] = time.time() + (interval if ok else 30)
-    # relax pacing back toward the floor on a clean pass
-    if not any(CACHE.get(p, {}).get("error") for p in CACHE):
-        PACE = max(float(os.environ.get("BOOK_CACHE_PACING", "1.6")), PACE * 0.9)
-        STATS["pace"] = round(PACE, 2)
+def worker(token, jobs, label):
+    """One Involio account: own pacing, own throttle state, own profile slice."""
+    pace = PACE_FLOOR
+    while True:
+        did = False
+        for profile, pid in jobs:
+            if COOLDOWN_UNTIL.get(profile, 0) > time.time():
+                continue
+            with LOCK:
+                if time.time() < DUE.get(profile, 0):
+                    continue
+            did = True
+            time.sleep(pace)
+            try:
+                book = source_api.fetch_source_book(profile=profile, portfolio_id=pid,
+                                                    refresh_token=token)
+                with LOCK:
+                    CACHE[profile] = {"book": book, "ts": time.time(), "error": None, "token": label}
+                STATS["fetches"] += 1
+                interval = HOT_INTERVAL if profile in HOT else COLD_INTERVAL
+                with LOCK:
+                    DUE[profile] = time.time() + interval
+            except Exception as e:
+                msg = str(e)[:140]
+                with LOCK:
+                    prev = CACHE.get(profile) or {}
+                    CACHE[profile] = {"book": prev.get("book"), "ts": prev.get("ts"),
+                                      "error": msg, "err_ts": time.time(), "token": label}
+                    DUE[profile] = time.time() + 20
+                STATS["errors"] += 1
+                if "429" in msg:
+                    COOLDOWN_UNTIL[profile] = time.time() + COOLDOWN
+                    pace = min(pace * 1.3, 5.0)
+        if not did:
+            time.sleep(1.5)
+        else:
+            pace = max(PACE_FLOOR, pace * 0.95)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -173,9 +152,9 @@ class Handler(BaseHTTPRequestHandler):
             profile = (q.get("profile") or [""])[0]
             with LOCK:
                 rec = CACHE.get(profile) or {}
-                book = rec.get("book")
-                age = (time.time() - rec["ts"]) if rec.get("ts") else None
-                err = rec.get("error")
+                book, age, err = rec.get("book"), None, rec.get("error")
+                if rec.get("ts"):
+                    age = time.time() - rec["ts"]
             if book is None:
                 return self._send(404, {"ok": False, "error": err or "not cached yet"})
             if age is not None and age > MAX_AGE:
@@ -184,12 +163,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/health":
             now = time.time()
             with LOCK:
-                table = {p: {"age": round(now - (v.get("ts") or now), 1),
-                             "error": v.get("error"), "tier": "hot" if p in HOT else "cold"}
+                table = {p: {"age": round(now - (v.get("ts") or now), 1), "error": v.get("error"),
+                             "tier": "hot" if p in HOT else "cold", "token": v.get("token")}
                          for p, v in CACHE.items()}
-            return self._send(200, {"ok": True, "max_age": MAX_AGE,
-                                    "hot_interval": HOT_INTERVAL, "cold_interval": COLD_INTERVAL,
-                                    "stats": STATS, "profiles": table})
+            return self._send(200, {"ok": True, "max_age": MAX_AGE, "hot_interval": HOT_INTERVAL,
+                                    "cold_interval": COLD_INTERVAL, "stats": STATS, "profiles": table})
         return self._send(404, {"ok": False, "error": "unknown path"})
 
 
@@ -197,24 +175,26 @@ GROUPS = groups()
 for _env, _pairs in GROUPS:
     for _prof, _pid in _pairs:
         source_api.PROFILES.setdefault(_prof, _pid)
-JOBS = [(prof, pid, env, token_from(env)) for env, pairs in GROUPS for prof, pid in pairs]
 
+MAIN_TOKEN = token_from("/home/ubuntu/involio-hypercopy-runner/vps-listener/.env")
+SECOND_TOKEN = token_from(TOKEN2_FILE)
 
-def loop():
-    while True:
-        try:
-            refresh_hot_set()
-            scheduler()
-            STATS["cycles"] += 1
-            STATS["last_cycle"] = time.time()
-        except Exception as e:
-            print("scheduler error:", str(e)[:160], flush=True)
-        time.sleep(2)
+ALL_JOBS = [(prof, pid) for _env, pairs in GROUPS for prof, pid in pairs]
+if SECOND_TOKEN:
+    # split the profiles between the two accounts so they fetch in parallel
+    jobs1 = [j for i, j in enumerate(ALL_JOBS) if i % 2 == 0]
+    jobs2 = [j for i, j in enumerate(ALL_JOBS) if i % 2 == 1]
+else:
+    jobs1, jobs2 = ALL_JOBS, []
 
+STATS["tokens"] = 2 if SECOND_TOKEN else 1
 
 if __name__ == "__main__":
-    hot_hint = sum(1 for j in JOBS if True)
-    print("book-cache tiers on 127.0.0.1:%d | %d profiles | hot %.0fs cold %.0fs"
-          % (PORT, len(JOBS), HOT_INTERVAL, COLD_INTERVAL), flush=True)
-    threading.Thread(target=loop, daemon=True).start()
+    print("book-cache: %d profiles | account A: %d, account B: %d | hot %.0fs cold %.0fs"
+          % (len(ALL_JOBS), len(jobs1), len(jobs2), HOT_INTERVAL, COLD_INTERVAL), flush=True)
+    threading.Thread(target=worker, args=(MAIN_TOKEN, jobs1, "A"), daemon=True).start()
+    if jobs2:
+        threading.Thread(target=worker, args=(SECOND_TOKEN, jobs2, "B"), daemon=True).start()
+    threading.Thread(target=lambda: [(refresh_hot_set(), time.sleep(20)) for _ in iter(int, 1)],
+                     daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

@@ -363,21 +363,21 @@ def _cached_access(session, refresh_token, force=False):
     return access
 
 
-def fetch_source_book(profile=PROFILE, portfolio_id=None):
+def fetch_source_book(profile=PROFILE, portfolio_id=None, refresh_token=None):
     # owner 2026-11-12: retry-once wrapper. A count disagreement caused by
     # stale cached metadata is retried with a fresh metadata fetch; a
     # disagreement against fresh metadata is a genuine data problem and
     # still refuses the book (never infer closures from an unverified
     # snapshot).
     try:
-        return _fetch_source_book_impl(profile, portfolio_id)
+        return _fetch_source_book_impl(profile, portfolio_id, refresh_token=refresh_token)
     except SourceDataError as e:
         if 'STALE-META' in str(e):
-            return _fetch_source_book_impl(profile, portfolio_id, fresh_meta=True)
+            return _fetch_source_book_impl(profile, portfolio_id, fresh_meta=True, refresh_token=refresh_token)
         raise
 
 
-def _fetch_source_book_impl(profile=PROFILE, portfolio_id=None, fresh_meta=False):
+def _fetch_source_book_impl(profile=PROFILE, portfolio_id=None, fresh_meta=False, refresh_token=None):
 
     if portfolio_id is None:
         if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
@@ -385,7 +385,7 @@ def _fetch_source_book_impl(profile=PROFILE, portfolio_id=None, fresh_meta=False
     cached=_book_cache_get(profile)
     if cached is not None:
         return cached
-    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    token=refresh_token or os.environ.get('INVOLIO_REFRESH_TOKEN','')
     if not token: raise SourceDataError('Involio source credential missing on VPS')
     session=FailoverSession()
     session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
