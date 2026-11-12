@@ -100,32 +100,36 @@ def worker(token, jobs, label):
     while True:
         did = False
         for profile, pid in jobs:
-            if COOLDOWN_UNTIL.get(profile, 0) > time.time():
+            ck = "%s|%s" % (profile, pid)
+            if COOLDOWN_UNTIL.get(ck, 0) > time.time():
                 continue
             with LOCK:
-                if time.time() < DUE.get(profile, 0):
+                if time.time() < DUE.get(ck, 0):
                     continue
             did = True
             time.sleep(pace)
+            ck = "%s|%s" % (profile, pid)   # composite key: one entry per portfolio
             try:
                 book = source_api.fetch_source_book(profile=profile, portfolio_id=pid,
                                                     refresh_token=token)
                 with LOCK:
-                    CACHE[profile] = {"book": book, "ts": time.time(), "error": None, "token": label}
+                    CACHE[ck] = {"book": book, "ts": time.time(), "error": None, "token": label,
+                                 "profile": profile, "pid": pid}
                 STATS["fetches"] += 1
                 interval = HOT_INTERVAL if profile in HOT else COLD_INTERVAL
                 with LOCK:
-                    DUE[profile] = time.time() + interval
+                    DUE[ck] = time.time() + interval
             except Exception as e:
                 msg = str(e)[:140]
                 with LOCK:
-                    prev = CACHE.get(profile) or {}
-                    CACHE[profile] = {"book": prev.get("book"), "ts": prev.get("ts"),
-                                      "error": msg, "err_ts": time.time(), "token": label}
-                    DUE[profile] = time.time() + 20
+                    prev = CACHE.get(ck) or {}
+                    CACHE[ck] = {"book": prev.get("book"), "ts": prev.get("ts"),
+                                 "error": msg, "err_ts": time.time(), "token": label,
+                                 "profile": profile, "pid": pid}
+                    DUE[ck] = time.time() + 20
                 STATS["errors"] += 1
                 if "429" in msg:
-                    COOLDOWN_UNTIL[profile] = time.time() + COOLDOWN
+                    COOLDOWN_UNTIL[ck] = time.time() + COOLDOWN
                     pace = min(pace * 1.3, 5.0)
         if not did:
             time.sleep(1.5)
@@ -150,8 +154,38 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/book":
             profile = (q.get("profile") or [""])[0]
+            want_pid = (q.get("portfolio_id") or [None])[0]
             with LOCK:
-                rec = CACHE.get(profile) or {}
+                keys = [k for k, v in CACHE.items() if v.get("profile") == profile]
+                if want_pid:
+                    keys = [k for k in keys if k.endswith("|" + str(want_pid))]
+                rec = CACHE.get(keys[0]) if len(keys) == 1 else {}
+                if len(keys) > 1:
+                    for k in keys:
+                        v = CACHE[k]
+                        if v.get("error"):
+                            rec = {"error": v["error"], "ts": v.get("ts")}
+                            break
+                    else:
+                        merged = {"positions": [], "equity": 0.0}
+                        oldest = None
+                        for k in keys:
+                            bk = CACHE[k].get("book") or {}
+                            merged["positions"].extend(bk.get("positions") or [])
+                            try:
+                                merged["equity"] += float(bk.get("equity") or 0)
+                            except Exception:
+                                pass
+                            ts = CACHE[k].get("ts") or 0
+                            oldest = ts if oldest is None else min(oldest, ts)
+                        seen, uniq = set(), []
+                        for p in merged["positions"]:
+                            ident = p.get("source_id") or (p.get("ticker"), p.get("side"))
+                            if ident in seen:
+                                continue
+                            seen.add(ident); uniq.append(p)
+                        merged["positions"] = uniq
+                        rec = {"book": merged, "ts": oldest, "error": None}
                 book, age, err = rec.get("book"), None, rec.get("error")
                 if rec.get("ts"):
                     age = time.time() - rec["ts"]
