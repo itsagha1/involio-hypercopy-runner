@@ -1,0 +1,592 @@
+import time
+import os
+"""Read-only Involio adapter. All credentials stay in the VPS environment."""
+from datetime import datetime, timezone
+import json, math, os, time, requests
+PROFILE = 'booobsas'
+PORTFOLIO_ID = '1c4f8dfd-3e4c-4378-b6fd-a0f694c10fd3'
+PROFILES={'booobsas':PORTFOLIO_ID,'akira':'72813ea9-35db-4ffe-b0b1-2d71cbbac837','oozypath':'2f5cb886-dfa0-457a-976e-4bc9c13ce35e','johndrockefeller':'dae63459-fbe6-4875-8e07-e60dcf9776c4','_k2_':'b34527e7-44e3-4e33-94a0-c2b7d637c6c6'}
+# Owner 2026-10-28: Involio migrated their API to api.invoapp.com (the web app
+# bundle calls it); the legacy api.involio.com is unreachable from datacenter
+# networks. Env-overridable for any future migration.
+BASE = os.environ.get('INVOLIO_API_BASE', 'https://api.invoapp.com')
+
+# Owner 2026-10-28: network-level API-domain failover. The Invo platform
+# (app.invoapp.com) has run its API on two domains historically (legacy brand
+# api.involio.com, current api.invoapp.com). If the active host becomes
+# UNREACHABLE at the network level (connect/timeout - NOT HTTP app errors),
+# probe the known alternates; the first reachable one becomes the new BASE
+# (persisted to /tmp, global switch). Self-heals domain migrations without
+# human intervention. HTTP-level errors (500/401/etc) are surfaced unchanged.
+KNOWN_API_BASES=[b for b in ['https://api.invoapp.com','https://api.involio.com']]
+_API_BASE_CACHE_FILE='/tmp/involio_api_base.txt'
+
+def _persist_base(new_base):
+    global BASE
+    BASE=new_base
+    try:
+        with open(_API_BASE_CACHE_FILE,'w') as _f: _f.write(new_base)
+    except Exception:
+        pass
+
+class FailoverSession(requests.Session):
+    # Cloudflare origin-down codes mean the host itself is effectively dead
+    # (edge alive, origin unreachable) - same treatment as transport failures.
+    # Genuine app errors (401/404/500...) are surfaced to the caller unchanged.
+    _ORIGIN_DOWN=(520,521,522,523,524)
+
+    def request(self, method, url, **kwargs):
+        global BASE
+        first_err=None
+        try:
+            response=super().request(method, url, **kwargs)
+            host_down=response.status_code in self._ORIGIN_DOWN
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
+            first_err=err
+            response=None
+            host_down=True
+        if not host_down:
+            return response
+        if not url.startswith(BASE):
+            return response
+        for alt in [b for b in KNOWN_API_BASES if b != BASE]:
+            try:
+                response=super().request(method, alt+url[len(BASE):], **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                continue
+            if response.status_code in self._ORIGIN_DOWN:
+                continue
+            _persist_base(alt)
+            print('[source_api] API host failover: previous host down; switched BASE -> '+alt, flush=True)
+            return response
+        if first_err is not None:
+            raise first_err
+        return response
+
+class SourceDataError(RuntimeError):
+    pass
+
+def positive(value, name):
+    try: value = float(value)
+    except (TypeError, ValueError): raise SourceDataError('Invalid '+name)
+    if not math.isfinite(value) or value <= 0:
+        raise SourceDataError('Nonpositive '+name)
+    return value
+
+_OWNER_CACHE_FILE = '/var/lib/hypercopy-copy/source_owners.json'
+
+
+def _owner_cache():
+    try:
+        with open(_OWNER_CACHE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _remember_owner(portfolio_id, owner_id, username, portfolio=None):
+    """Persist identity so a rename is detectable and a stranger is not.
+
+    Owner 2026-11-09 (booobsas -> inquisitor): the cache had NO entry for the
+    booobsas portfolio, so a rename looked exactly like a foreign account and
+    the whole book died silently. We now store the portfolio's own immutable
+    fingerprints (createdAt + title) alongside the owner, which lets a rename be
+    accepted while a genuinely transferred portfolio is still rejected."""
+    try:
+        cache = _owner_cache()
+        prev = cache.get(portfolio_id) or {}
+        p = portfolio or {}
+        cache[portfolio_id] = {
+            'owner_id': owner_id,
+            'username': username,
+            'usernames': sorted(set((prev.get('usernames') or []) + [username])) if username else prev.get('usernames'),
+            'created_at': p.get('createdAt') or prev.get('created_at'),
+            'title': p.get('title') if p.get('title') is not None else prev.get('title'),
+            'seen_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        }
+        tmp = _OWNER_CACHE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cache, f, indent=0)
+        os.replace(tmp, _OWNER_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def check_owner(profile, portfolio_id, portfolio):
+    """Owner 2026-11-02: a source renamed the account (nathanbrown -> thebakerr)
+    and the username check silently killed the whole book. Validate on the
+    stable owner USER ID once known for this portfolio id; learn new usernames."""
+    allowed = {x.strip() for x in str(profile).split(',') if x.strip()}
+    own = portfolio.get('owner') or {}
+    uname = own.get('username')
+    oid = own.get('id')
+    if uname in allowed:
+        _remember_owner(portfolio_id, oid, uname, portfolio)
+        return
+    rec = _owner_cache().get(portfolio_id) or {}
+    if oid and rec.get('owner_id') == oid:
+        _remember_owner(portfolio_id, oid, uname, portfolio)
+        return
+    # Same portfolio, new owner name (rename). Accept only when the portfolio's
+    # immutable identity matches what we recorded, so a transferred portfolio
+    # is still refused.
+    same_identity = bool(rec.get('created_at')) and \
+        rec.get('created_at') == (portfolio.get('createdAt') or rec.get('created_at')) and \
+        (rec.get('title') or '') == (portfolio.get('title') or rec.get('title') or '')
+    if same_identity:
+        try:
+            with open('/var/lib/hypercopy-copy/source_renames.log', 'a') as f:
+                f.write('%s SOURCE-RENAMED %s: %s -> %s (%s)\n' % (
+                    datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    portfolio_id, rec.get('username'), uname, portfolio.get('title')))
+        except Exception:
+            pass
+        _remember_owner(portfolio_id, oid, uname, portfolio)
+        return
+    raise SourceDataError('Wrong source owner')
+
+
+def normalize_source(meta, raw_positions, sims, profile=PROFILE, portfolio_id=None):
+    # owner 2026-10-16: profile may be comma-separated (multi-owner subaccount,
+    # e.g. bluespire,b4451). Every name must be registered; the portfolio's
+    # owner username must be one of them.
+    allowed = {x.strip() for x in str(profile).split(",") if x.strip()}
+    if not allowed:
+        raise SourceDataError("Unauthorized source profile")
+    for name in allowed:
+        if name not in PROFILES:
+            raise SourceDataError("Unauthorized source profile")
+    portfolio_id = portfolio_id or PROFILES[profile]
+    portfolio = meta.get('portfolio') or {}
+    if meta.get('success') is not True or portfolio.get('id') != portfolio_id:
+        raise SourceDataError('Wrong or incomplete source portfolio')
+    check_owner(profile, portfolio_id, portfolio)
+    if sims.get('success') is not True or not isinstance(sims.get('investments'), list):
+        raise SourceDataError('Incomplete source sim data')
+    expected = int(portfolio.get('openPositions', -1))
+    if expected != len(raw_positions) or len(sims['investments']) != len(raw_positions):
+        raise SourceDataError('Source snapshot counts disagree; not safe to infer closures')
+    sim_by_id = {str(x.get('baseId')): x for x in sims['investments']}
+    if len(sim_by_id) != len(sims['investments']):
+        raise SourceDataError('Duplicate source sim identities')
+    positions=[];keys=set();ids=set()
+    for position in raw_positions:
+        identity=str(position.get('baseId') or '')
+        if not identity or identity in ids or identity not in sim_by_id:
+            raise SourceDataError('Missing or duplicate source trade identity')
+        ids.add(identity)
+        sim=sim_by_id[identity]
+        if position.get('isOpen') is not True:
+            raise SourceDataError('Closed position present in open snapshot')
+        margin=positive(position.get('entrySim'), 'source margin')
+        other=positive(sim.get('entrySim'), 'source sim margin')
+        if abs(margin-other)>max(1e-7,margin*1e-7):
+            raise SourceDataError('Source changed while snapshot was fetched')
+        leverage=positive(position.get('leverage'), 'leverage')
+        entry=positive(position.get('entryPrice'), 'entry price')
+        current=positive(position.get('currentPrice'), 'current price')
+        pct=positive(position.get('entrySize'), 'declared allocation percentage')
+        if pct>100: raise SourceDataError('Invalid declared allocation percentage')
+        if not isinstance(position.get('directionLong'), bool):
+            raise SourceDataError('Missing source direction')
+        if (position.get('portfolio') or {}).get('id') != portfolio_id:
+            raise SourceDataError('Position belongs to a different source portfolio')
+        ticker=str(position.get('ticker') or '')
+        if not ticker: raise SourceDataError('Missing source ticker')
+        side='long' if position.get('directionLong') is True else 'short'
+        key=ticker+'/'+side
+        if key in keys: raise SourceDataError('Duplicate source symbol/side; cannot safely aggregate')
+        keys.add(key)
+        positions.append({'source_id':identity,'ticker':ticker,'side':side,
+                          'source_margin':margin,'source_qty':margin*leverage/entry,
+                          'source_allocation_pct':pct,'allocation_verified':True,
+                          'entry_sim':margin,'last_sim':sim.get('lastSim'),
+                          'entry_price':entry,'current_price':current,'leverage':leverage,
+                          'stop_loss':position.get('stopLoss'),
+                          'price_target':position.get('priceTarget'),
+                          'created_at':position.get('createdAt'),'updated_at':position.get('updatedAt')})
+    remaining=float(sims.get('portfolioRemainingSim'))
+    if not math.isfinite(remaining) or remaining<0: raise SourceDataError('Invalid source cash balance')
+    capital=remaining+sum(p['source_margin'] for p in positions)
+    positive(capital,'source allocated-capital balance')
+    return {'positions':positions,'source_equity':capital,'equity_verified':True,
+            'source_equity_basis':'gross_sim_allocatable_capital_not_fee_net_mark_equity',
+            'allocation_basis':'declared_entrySize_percent',
+            'source_portfolio_id':portfolio_id,'source_profile':profile,
+            'remaining_sim':remaining,'complete':True,
+            'snapshot_at':datetime.now(timezone.utc).isoformat(),
+            'source_total_fees':sims.get('portfolioTotalFeeSim')}
+
+def fetch_dex_book(session, profile=PROFILE, portfolio_id=None, portfolio=None):
+    """Owner 2026-10-19: LIVE portfolios (type='live', e.g. billionaireboysclub)
+    serve their books from the /dex/ endpoint family, NOT the v1_0 investments
+    API. Normalized to the same shape as the sim book so copy_listener needs no
+    changes. sizing: size.pct is the notional allocation % of equity, size.cash
+    is the notional; margin = cash / leverage; roi from net pnl pct."""
+    allowed = {x.strip() for x in str(profile).split(',') if x.strip()}
+    if not allowed: raise SourceDataError('Unauthorized source profile')
+    for name in allowed:
+        if name not in PROFILES: raise SourceDataError('Unauthorized source profile')
+    if portfolio is None or portfolio.get('id') != portfolio_id:
+        raise SourceDataError('Wrong or incomplete source portfolio')
+    check_owner(profile, portfolio_id, portfolio)
+    def get(path, params=None):
+        response=session.get(BASE+path, params=params or {}, timeout=25)
+        response.raise_for_status()
+        value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('DEX API failed for '+path)
+        return value.get('data') or {}
+    data=get('/dex/portfolio/position/'+str(portfolio_id)+'/list', {'isOpen':'true','limit':'100'})
+    raw=data.get('positions')
+    if not isinstance(raw, list): raise SourceDataError('Missing DEX open-position list')
+    overview=get('/dex/portfolio/live/'+str(portfolio_id)+'/overview')
+    equity=positive((overview.get('equity') or {}).get('value'), 'DEX equity')
+    positions=[];keys=set();ids=set()
+    for p in raw:
+        identity=str(p.get('id') or '')
+        ticker=str(p.get('assetSymbol') or '')
+        side=str(p.get('side') or '')
+        if not identity or identity in ids or not ticker or side not in ('long','short'):
+            raise SourceDataError('Missing/invalid DEX trade identity')
+        ids.add(identity)
+        key=ticker+'/'+side
+        if key in keys: raise SourceDataError('Duplicate source symbol/side; cannot safely aggregate')
+        keys.add(key)
+        leverage=positive(p.get('leverage'), 'leverage')
+        entry=positive(p.get('entryPx'), 'entry price')
+        current=positive(p.get('markPx'), 'mark price')
+        cash=positive((p.get('size') or {}).get('cash'), 'DEX position cash')
+        pct=positive((p.get('size') or {}).get('pct'), 'declared allocation percentage')
+        if pct>100: raise SourceDataError('Invalid declared allocation percentage')
+        try: net_pct=float(((p.get('pnl') or {}).get('net') or {}).get('pct') or 0)
+        except (TypeError, ValueError): raise SourceDataError('Invalid DEX net pnl')
+        margin=cash/leverage
+        # Owner 2026-10-22 qty-basis fix: size.coin/leverage is the EXACT coin
+        # quantity (verified: coin/lev == cash/markPx on every DEX position).
+        # size.cash is MARK-TO-MARKET notional (qty x markPx), so the previous
+        # cash/entryPx qty drifted with the market every poll and produced
+        # phantom size-sync adds/reduces on live-portfolio mirrors (RUNE case).
+        coin_qty=0.0
+        try:
+            _coin=(p.get('size') or {}).get('coin')
+            if _coin and leverage: coin_qty=float(_coin)/leverage
+        except (TypeError, ValueError): coin_qty=0.0
+        qty=coin_qty if coin_qty>0 else (cash/current if current else cash/entry)
+        positions.append({'source_id':identity,'ticker':ticker,'side':side,
+                          'source_margin':margin,'source_qty':qty,
+                          'source_allocation_pct':pct,'allocation_verified':True,
+                          'entry_sim':margin,'last_sim':margin*(1.0+net_pct/100.0),
+                          'entry_price':entry,'current_price':current,'leverage':leverage,
+                          'stop_loss':p.get('stopLossPx'),
+                          'price_target':p.get('takeProfitPx'),
+                          'created_at':p.get('openedAt'),'updated_at':p.get('openedAt')})
+    remaining=equity-sum(pp['source_margin'] for pp in positions)
+    if not math.isfinite(remaining) or remaining<0: raise SourceDataError('Invalid DEX source cash balance')
+    return {'positions':positions,'source_equity':equity,'equity_verified':True,
+            'source_equity_basis':'dex_live_overview_equity',
+            'allocation_basis':'declared_size_pct',
+            'source_portfolio_id':portfolio_id,'source_profile':profile,
+            'remaining_sim':remaining,'complete':True,
+            'snapshot_at':datetime.now(timezone.utc).isoformat()}
+
+
+_REMAINING_SIM_CACHE_FILE='/tmp/involio_remaining_sim_cache.json'
+try:
+    with open(_REMAINING_SIM_CACHE_FILE) as _f:
+        _LAST_REMAINING_SIM=json.load(_f)
+except Exception:
+    _LAST_REMAINING_SIM={}
+
+def _save_remaining_cache():
+    try:
+        with open(_REMAINING_SIM_CACHE_FILE,'w') as _f:
+            json.dump(_LAST_REMAINING_SIM,_f)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Owner 2026-11-11: shared book cache.
+# Six engines each logged into Involio and pulled every portfolio themselves.
+# At a 30s poll that tripped HTTP 429 and stalled every engine. A single
+# book-cache daemon now pulls each book once; engines read it from here.
+# Falls back to a direct fetch whenever the cache is down, stale or disabled,
+# so no engine can ever be blocked by it.
+# ---------------------------------------------------------------------------
+_ACCESS = {}          # refresh_token -> (access_token, fetched_at)
+_META = {}            # portfolio_id -> (portfolio metadata, fetched_at)
+_META_TTL = 1800      # portfolio type/metadata barely changes
+_ACCESS_TTL = 600     # Involio access tokens expire around 20 minutes
+
+
+def _cache_url():
+    return os.environ.get('BOOK_CACHE_URL', 'http://127.0.0.1:8010')
+
+
+def _book_cache_get(profile):
+    if os.environ.get('BOOK_CACHE_DISABLE') == '1':
+        return None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(_cache_url() + '/book?profile=' + str(profile), timeout=4) as r:
+            payload = json.loads(r.read().decode())
+        if payload.get('ok'):
+            return payload.get('book')
+    except Exception:
+        return None
+    return None
+
+
+def _invalidate(refresh_token):
+    _ACCESS.pop(refresh_token, None)
+
+
+def _cached_access(session, refresh_token, force=False):
+    now = time.time()
+    hit = _ACCESS.get(refresh_token)
+    if hit and not force and (now - hit[1]) < _ACCESS_TTL:
+        return hit[0]
+    response = session.get(BASE + '/v1_0/auth/refresh_token',
+                           headers={'Authorization': 'Bearer ' + refresh_token}, timeout=25)
+    response.raise_for_status()
+    access = response.json().get('accessToken')
+    if not access:
+        raise SourceDataError('Involio refresh did not return access token')
+    _ACCESS[refresh_token] = (access, now)
+    return access
+
+
+def fetch_source_book(profile=PROFILE, portfolio_id=None):
+
+    if portfolio_id is None:
+        if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+        portfolio_id=PROFILES[profile]
+    cached=_book_cache_get(profile)
+    if cached is not None:
+        return cached
+    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    if not token: raise SourceDataError('Involio source credential missing on VPS')
+    session=FailoverSession()
+    session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+    access=_cached_access(session,token)
+    session.headers['Authorization']='Bearer '+access
+    def post(path,data):
+        response=session.post(BASE+path,json=data,timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('Source API failed for '+path)
+        return value
+    def reauth():
+        _invalidate(token)
+        session.headers['Authorization'] = 'Bearer ' + _cached_access(session, token, force=True)
+
+    def post_retry(path,data,attempts=3):
+        # Owner 2026-10-28: Involio endpoints flap with transient 500s/null pages
+        # during partial outages; a short retry window keeps the engine alive
+        # (the main listener survived 3.5h of flapping purely via retries).
+        last=None
+        for a in range(attempts):
+            try:
+                return post(path,data)
+            except Exception as e:
+                last=e
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                if code in (401, 403):
+                    try:
+                        reauth()
+                        return post(path,data)
+                    except Exception as e2:
+                        last = e2
+                if a<attempts-1: time.sleep(1.5*(a+1))
+        raise last
+    hit=_META.get(portfolio_id)
+    if hit and (time.time()-hit[1])<_META_TTL:
+        metadata=hit[0]
+    else:
+        metadata=post_retry('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+        _META[portfolio_id]=(metadata,time.time())
+    if (metadata.get('portfolio') or {}).get('type') == 'live':
+        return fetch_dex_book(session, profile, portfolio_id, metadata.get('portfolio'))
+    positions=[]
+    for page in range(1,22):
+        if page>20: raise SourceDataError('Source pagination exceeded safety bound')
+        value=post_retry('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':page,'size':50}})
+        batch=value.get('investmentsTicker')
+        if not isinstance(batch,list): raise SourceDataError('Missing open-position page')
+        positions.extend(batch)
+        if len(batch)<50: break
+    try:
+        sims=post_retry('/v1_0/investments/get_investments_sims',{'portfolioId':portfolio_id})
+        if sims.get('success') is True and sims.get('portfolioRemainingSim') is not None:
+            _LAST_REMAINING_SIM[portfolio_id]=float(sims.get('portfolioRemainingSim'))
+            _save_remaining_cache()
+        if sims.get('success') is not True:
+            raise SourceDataError('sims success flag false')
+    except Exception:
+        # DEGRADED MODE (owner 2026-10-28, sims outage): the positions endpoint works
+        # but sims is down. Approximate per-position sim marks locally with the
+        # standard perp formula (entrySim + entrySim*lev*price_return) and reuse
+        # the last known portfolio cash balance. Mirroring stays alive; book is
+        # flagged sims_degraded for engine logging. ROI-skip math is approximate
+        # (ignores sim fees) - acceptable for the 2% entry-skip threshold.
+        remaining=_LAST_REMAINING_SIM.get(portfolio_id)
+        if remaining is None:
+            inv=(metadata.get('portfolio') or {}).get('investableSim')
+            try:
+                inv=float(inv)
+            except Exception:
+                inv=None
+            if inv is None or not math.isfinite(inv) or inv<0:
+                raise SourceDataError('sims unavailable and no cached cash balance; cannot size safely')
+            remaining=max(0.0, inv-sum(float(p.get('entrySim') or 0) for p in positions))
+        approx=[]
+        for p in positions:
+            try:
+                m=float(p.get('entrySim') or 0); lev=float(p.get('leverage') or 1)
+                e=float(p.get('entryPrice') or 0); c=float(p.get('currentPrice') or e)
+                ret=(c-e)/e if e else 0.0
+                if p.get('directionLong') is not True: ret=-ret
+                approx.append({'baseId':str(p.get('baseId')),'entrySim':m,
+                               'lastSim':max(0.0, m + m*lev*ret)})
+            except Exception:
+                raise SourceDataError('sims degraded and position math failed')
+        sims={'success':True,'degraded':True,'investments':approx,
+              'portfolioRemainingSim':remaining}
+    book=normalize_source(metadata,positions,sims,profile,portfolio_id)
+    book['sims_degraded']=bool(sims.get('degraded'))
+    return book
+
+
+def fetch_closed_base_ids(profile=PROFILE, portfolio_id=None, pages=2):
+    """Map of recently-closed Involio positions keyed by their ORIGINAL open
+    investment id (owner 2026-10-18). Closed records carry the open id in baseId.
+    Used by copy_listener to distinguish a normal source close (must be followed
+    at market, 100% mirror) from a genuinely vanished position (retention case)."""
+    if portfolio_id is None:
+        if profile not in PROFILES:raise SourceDataError("Unauthorized source profile")
+        portfolio_id=PROFILES[profile]
+    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    if not token: raise SourceDataError('Involio source credential missing on VPS')
+    session=FailoverSession()
+    session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+    response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
+    response.raise_for_status()
+    access=response.json().get('accessToken')
+    if not access: raise SourceDataError('Involio refresh did not return access token')
+    session.headers['Authorization']='Bearer '+access
+    meta=session.post(BASE+'/v1_0/portfolios/get_portfolio_by_id',json={'portfolioId':portfolio_id},timeout=25)
+    meta.raise_for_status();meta=meta.json()
+    if meta.get('success') is not True or (meta.get('portfolio') or {}).get('id') != portfolio_id:
+        raise SourceDataError('Source API failed for portfolio metadata')
+    closed={}
+    if (meta.get('portfolio') or {}).get('type') == 'live':
+        response=session.get(BASE+'/dex/portfolio/position/'+str(portfolio_id)+'/list',params={'isOpen':'false','limit':'100'},timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('DEX closed-list failed')
+        for x in (value.get('data') or {}).get('positions') or []:
+            closed[str(x.get('id'))]={'ticker':x.get('assetSymbol'),'closedAt':x.get('closedAt'),'reason':x.get('closeReason')}
+        return closed
+    for page in range(1,max(1,int(pages))+1):
+        response=session.post(BASE+'/v1_0/investments/get_investments',json={'portfolioId':portfolio_id,'isOpen':False,'params':{'page':page,'size':50}},timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('Source API failed for closed investments')
+        batch=value.get('investmentsTicker')
+        if not isinstance(batch,list): raise SourceDataError('Missing closed-position page')
+        for x in batch:
+            bid=x.get('baseId')
+            if bid:
+                closed[bid]={'ticker':x.get('ticker'),'closedAt':x.get('closedAt'),'reason':x.get('reasonClosed')}
+        if len(batch)<50: break
+    return closed
+
+
+def fetch_source_stats(profile=PROFILE, portfolio_id=None):
+    """Owner 2026-10-19: per-source performance stats for the dashboard:
+    trades within the last 24h (closed in window + opened in window and still
+    open), open count, total trades, wins/losses and total P/L. paper/sim
+    portfolios use portfolio metadata (closedPositions, winRate, plSnapshot)
+    plus closed/open book scans for the 24h window; live (DEX) portfolios use
+    /dex/portfolio/live/<pid>/overview (allTimePnl, closedCount, accuracyPct,
+    pnl24h) plus the DEX open/closed lists."""
+    from datetime import timedelta
+    if portfolio_id is None:
+        if profile not in PROFILES: raise SourceDataError('Unauthorized source profile')
+        portfolio_id = PROFILES[profile]
+    token=os.environ.get('INVOLIO_REFRESH_TOKEN','')
+    if not token: raise SourceDataError('Involio source credential missing on VPS')
+    session=FailoverSession()
+    session.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+    response=session.get(BASE+'/v1_0/auth/refresh_token',headers={'Authorization':'Bearer '+token},timeout=25)
+    response.raise_for_status()
+    access=response.json().get('accessToken')
+    if not access: raise SourceDataError('Involio refresh did not return access token')
+    session.headers['Authorization']='Bearer '+access
+    def post(path,data):
+        response=session.post(BASE+path,json=data,timeout=25)
+        response.raise_for_status();value=response.json()
+        if value.get('success') is not True or value.get('error'):
+            raise SourceDataError('Source API failed for '+path)
+        return value
+    meta=post('/v1_0/portfolios/get_portfolio_by_id',{'portfolioId':portfolio_id})
+    portfolio=meta.get('portfolio') or {}
+    if portfolio.get('id') != portfolio_id:
+        raise SourceDataError('Wrong or incomplete source portfolio')
+    now=datetime.now(timezone.utc)
+    def recent(iso):
+        if not iso: return False
+        try: t=datetime.fromisoformat(str(iso).replace('Z','+00:00'))
+        except (TypeError, ValueError): return False
+        if t.tzinfo is None: t=t.replace(tzinfo=timezone.utc)
+        return (now-t) <= timedelta(hours=24)
+    if portfolio.get('type')=='live':
+        def get(path,params=None):
+            response=session.get(BASE+path,params=params or {},timeout=25)
+            response.raise_for_status();value=response.json()
+            if value.get('success') is not True or value.get('error'):
+                raise SourceDataError('DEX API failed for '+path)
+            return value.get('data') or {}
+        overview=get('/dex/portfolio/live/'+str(portfolio_id)+'/overview')
+        cl=get('/dex/portfolio/position/'+str(portfolio_id)+'/list',{'isOpen':'false','limit':'100'})
+        op=get('/dex/portfolio/position/'+str(portfolio_id)+'/list',{'isOpen':'true','limit':'100'})
+        closed_recent=sum(1 for x in (cl.get('positions') or []) if recent(x.get('closedAt')))
+        opened_recent=sum(1 for x in (op.get('positions') or []) if recent(x.get('openedAt')))
+        closed_total=int(float(overview.get('closedCount') or 0))
+        acc=float(overview.get('accuracyPct') or 0)
+        wins=int(round(acc/100.0*closed_total)) if closed_total else 0
+        atp=overview.get('allTimePnl') or {}
+        p24=overview.get('pnl24h') or {}
+        open_now=int((overview.get('openTrades') or {}).get('count') or 0)
+        return {'profile':profile,'portfolio_title':portfolio.get('title'),'type':'live','unit':'cash',
+                'open_now':open_now,'trades_24h':closed_recent+opened_recent,
+                'closed_24h':closed_recent,'opened_24h':opened_recent,
+                'total_trades':closed_total+open_now,'wins':wins,'losses':max(0,closed_total-wins),
+                'total_pnl':float(atp.get('cash') or 0),'total_pnl_pct':float(atp.get('pct') or 0),
+                'pnl_24h':float(p24.get('cash') or 0),
+                'equity':float((overview.get('equity') or {}).get('value') or 0)}
+    closed=[]
+    for page in (1,2):
+        value=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':False,'params':{'page':page,'size':50}})
+        batch=value.get('investmentsTicker')
+        if not isinstance(batch,list): raise SourceDataError('Missing closed-position page')
+        closed.extend(batch)
+        if len(batch)<50: break
+    opened=post('/v1_0/investments/get_investments',{'portfolioId':portfolio_id,'isOpen':True,'params':{'page':1,'size':50}}).get('investmentsTicker') or []
+    closed_total=int(float(portfolio.get('closedPositions') or 0))
+    open_now=int(float(portfolio.get('openPositions') or 0))
+    closed_recent=[x for x in closed if recent(x.get('closedAt'))]
+    opened_recent=sum(1 for x in opened if recent(x.get('createdAt')))
+    win_rate=float(portfolio.get('winRate') or 0)
+    wins=int(round(win_rate/100.0*closed_total)) if closed_total else 0
+    pnl_24h=0.0
+    for x in closed_recent:
+        try: pnl_24h+=float(x.get('lastSim') or 0)-float(x.get('entrySim') or 0)
+        except (TypeError, ValueError): pass
+    return {'profile':profile,'portfolio_title':portfolio.get('title'),'type':'paper','unit':'sim',
+            'open_now':open_now,'trades_24h':len(closed_recent)+opened_recent,
+            'closed_24h':len(closed_recent),'opened_24h':opened_recent,
+            'total_trades':closed_total+open_now,'wins':wins,'losses':max(0,closed_total-wins),
+            'total_pnl':float(portfolio.get('plSnapshot') or 0),'total_pnl_pct':None,
+            'pnl_24h':pnl_24h,'equity':None}
