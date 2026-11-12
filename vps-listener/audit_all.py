@@ -287,6 +287,15 @@ for name, port, state_path in ENGINES:
         if d2 and d2.get("errors_last_run"):
             finding("critical", name, "errors after repair restart (%s)" % d2.get("errors_last_run"))
 
+# ---- urgent margin flags raised by the guard -------------------------
+try:
+    import glob as _glob
+    for _f in _glob.glob("/var/lib/hypercopy-copy/margin_URGENT_*.flag"):
+        _body = open(_f).read().strip().replace("\n", " ")[:160]
+        finding("critical", "margin", "guard raised URGENT: " + _body)
+except Exception as _e:
+    finding("info", "margin", "urgent flag check skipped (%s)" % str(_e)[:40])
+
 # ---------------------------------------------------------------- 7. relief
 try:
     rel = load("/var/lib/hypercopy-copy/margin_relief.json") or {}
@@ -333,7 +342,8 @@ RESULT = {
     },
     "engines": {n: {"errors": (d or {}).get("errors_last_run"),
                     "mirrors": len((d or {}).get("mirrored") or {}),
-                    "margin": (d or {}).get("margin_pct")}
+                    "margin": (d or {}).get("margin_pct"),
+                    "im_rate": (d or {}).get("im_rate")}
                 for n, d in engine_status.items()},
     "cache": None if not cache_health else {
         "profiles": len(cache_health.get("profiles") or {}),
