@@ -435,7 +435,7 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
             lev = int(rec.get("leverage") or 1) or 1
             if delta * float(client.get_ticker(symbol)["lastPrice"]) / lev > avail * MAX_AVAIL_PER_TRADE:
                 rec["desired_source_qty"] = curr_sq
-                request_add_fund(COPY_NAME, 100.0)
+                request_add_fund(NAME, 100.0)
                 return f"SKIP {key} size_add: insufficient available balance - target kept for retry"
             place_order_mode_safe(client, symbol, bybit_side(side), delta, position_idx=idx,
                                order_link_id=order_link(key, "add", int(rec.get("gen", 0))))

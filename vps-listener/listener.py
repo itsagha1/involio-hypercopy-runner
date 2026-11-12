@@ -2464,6 +2464,20 @@ def selfcheck_fix(x_signature: str = Header(default="")):
     except Exception as e:
         kb_result = {"error": str(e)[:120]}
 
+    # --- fleet-wide repair (owner 2026-11-12) -----------------------------
+    try:
+        _fa_fix = _fleet_audit("")
+        if _fa_fix.get("error"):
+            problems.append("fleet audit: %s" % str(_fa_fix["error"])[:100])
+        else:
+            for _a in _fa_fix.get("actions") or []:
+                fixed.append({"account": _a.get("area"), "action": _a.get("action")})
+            _fc = _fa_fix.get("counts") or {}
+            if _fc.get("critical"):
+                problems.append("fleet audit left %d critical finding(s)" % _fc["critical"])
+    except Exception as _fe:
+        problems.append("fleet audit skipped: %s" % str(_fe)[:80])
+
     log_action("SELFCHECK-FIX %d item(s) repaired" % len(fixed) + (("; problems: " + "; ".join(problems)) if problems else ""))
     return {"ok": True, "fixed_count": len(fixed), "fixed": fixed, "problems": problems,
             "kb": kb_result,
@@ -2531,6 +2545,28 @@ def source_lost(body: dict = Body(default=None), x_signature: str = Header(defau
     save_state(state)
     log_action("SOURCE-LOST %s: %d mirror(s) parked as owner-managed with TP" % (prof, len(acted)))
     return {"ok": True, "profile": prof, "moved": len(acted), "actions": acted}
+
+
+
+def _fleet_audit(mode="--scan", timeout=240):
+    """Owner 2026-11-12: the fleet-wide audit repairs the classes of fault that
+    used to need a human (retained positions whose source is still open, mirrors
+    with no exchange position, stale labels, a broken book cache, both Involio
+    accounts, relief and spillover sanity)."""
+    import json as _json
+    import subprocess as _sp
+    py = "/home/ubuntu/involio-hypercopy-runner/vps-listener/venv/bin/python"
+    script = "/home/ubuntu/involio-hypercopy-runner/vps-listener/audit_all.py"
+    try:
+        out = _sp.run(["sudo", "-n", py, script] + ([mode] if mode else []),
+                      capture_output=True, text=True, timeout=timeout)
+        raw = out.stdout or ""
+        start = raw.find("{")
+        if start < 0:
+            return {"error": (out.stderr or "no output")[:200]}
+        return _json.loads(raw[start:])
+    except Exception as e:
+        return {"error": str(e)[:150]}
 
 
 @app.post("/selfcheck/scan")
@@ -2701,6 +2737,23 @@ def selfcheck_scan(x_signature: str = Header(default="")):
         kb_summary = {"error": str(e)[:120]}
 
     order = {"critical": 0, "warning": 1, "info": 2}
+    # --- fleet-wide audit (all seven engines, cache, both Involio accounts) --
+    try:
+        _fa = _fleet_audit("--scan")
+        if _fa.get("error"):
+            add("info", "fleet", "fleet audit unavailable (%s)" % _fa["error"][:60], False)
+        else:
+            for _f in _fa.get("findings") or []:
+                if _f.get("severity") in ("critical", "warning"):
+                    add(_f["severity"], "fleet:" + str(_f.get("area")), str(_f.get("message"))[:160],
+                        bool(_f.get("fixable")))
+            _c = _fa.get("counts") or {}
+            if _c.get("critical"):
+                add("critical", "fleet", "%d critical finding(s) across the fleet - press Fix it"
+                    % _c["critical"], True)
+    except Exception as _fe:
+        add("info", "fleet", "fleet audit pass skipped (%s)" % str(_fe)[:60], False)
+
     items.sort(key=lambda i: order.get(i["severity"], 3))
     fixable = sum(1 for i in items if i["fixable"])
     log_action("SELFCHECK-SCAN %d finding(s), %d safe fix(es), kb %s" % (
