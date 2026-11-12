@@ -110,6 +110,26 @@ def pending_add_funds():
     return out
 
 
+def equity_margin(client, wallet, pos):
+    """Owner 2026-11-12: judge margin the way the exchange does.
+
+    The old calculation divided margin by WALLET, which ignores open losses:
+    subaccount 04 read 62.9% while Bybit's initial-margin rate was 98.3%, so
+    the 90% relief trigger could never fire. Use the exchange's accountIMRate
+    (initial margin over equity); fall back to the old figure if unavailable."""
+    try:
+        r = client._get('/v5/account/wallet-balance', {'accountType': 'UNIFIED'})
+        x = (r.get('list') or [{}])[0]
+        rate = x.get('accountIMRate')
+        im = x.get('totalInitialMargin')
+        if rate is not None and im is not None:
+            return float(rate) * 100.0, float(im), float(x.get('totalEquity') or 0)
+    except Exception:
+        pass
+    pct, used = margin_pct(wallet, pos)
+    return pct, used, wallet
+
+
 def main():
     state = load_state()
     now = time.time()
@@ -132,7 +152,7 @@ def main():
         except Exception as e:
             log('%s: read failed (%s)' % (name, str(e)[:70]))
             continue
-        pct, used = margin_pct(wallet, pos)
+        pct, used, equity = equity_margin(c, wallet, pos)
         st = state['accounts'].setdefault(key, {'outstanding': 0.0, 'last_action_ts': 0})
         out = float(st.get('outstanding') or 0)
         if DRY_RUN or pct >= 70:
@@ -186,7 +206,7 @@ def main():
 
         # --- relief: margin has run up to the trigger ---
         if pct >= TRIGGER_PCT and out < MAX_OUTSTANDING and since >= COOLDOWN_SECONDS:
-            needed = round(used / (TARGET_PCT / 100.0) - wallet, 2)
+            needed = round(used / (TARGET_PCT / 100.0) - equity, 2)
             amount = max(MIN_AMOUNT, min(MAX_AMOUNT, needed))
             amount = round(min(amount, MAX_OUTSTANDING - out), 2)
             if amount < 1:
