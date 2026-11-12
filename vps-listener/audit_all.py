@@ -121,6 +121,14 @@ for name, port, _state in ENGINES:
         _rate = float(_x.get("accountIMRate") or 0) * 100.0
         _free = float(_x.get("totalAvailableBalance") or 0)
         engine_status.setdefault(name, {})["im_rate"] = round(_rate, 2)
+        # owner 2026-11-12: the number the app shows must be the exchange number.
+        _shown = d.get("margin_pct") if isinstance(d, dict) else None
+        if _shown is not None and abs(float(_shown) - _rate) > 1.5:
+            finding("warning", name,
+                    "display shows %.2f%% margin but the exchange says %.2f%% - stale basis, restart the engine"
+                    % (float(_shown), _rate))
+        elif _shown is not None:
+            engine_status.setdefault(name, {})["margin_matches_exchange"] = True
         if _rate >= 95:
             finding("critical", name, "IM rate %.2f%% against equity, free %.2f - liquidation risk NOW" % (_rate, _free))
         elif _rate >= 90:
@@ -343,7 +351,8 @@ RESULT = {
     "engines": {n: {"errors": (d or {}).get("errors_last_run"),
                     "mirrors": len((d or {}).get("mirrored") or {}),
                     "margin": (d or {}).get("margin_pct"),
-                    "im_rate": (d or {}).get("im_rate")}
+                    "im_rate": (d or {}).get("im_rate"),
+                    "margin_matches_exchange": (d or {}).get("margin_matches_exchange")}
                 for n, d in engine_status.items()},
     "cache": None if not cache_health else {
         "profiles": len(cache_health.get("profiles") or {}),

@@ -30,6 +30,12 @@ HOT_INTERVAL = float(os.environ.get("BOOK_CACHE_HOT", "25"))
 COLD_INTERVAL = float(os.environ.get("BOOK_CACHE_COLD", "240"))
 PACE_FLOOR = float(os.environ.get("BOOK_CACHE_PACING", "1.2"))
 COOLDOWN = float(os.environ.get("BOOK_CACHE_COOLDOWN", "180"))
+# Owner 2026-11-12: a cold start used to fire every profile at once and burn the
+# Involio rate limit (26 x 429 in one cycle). Spread the first pass instead, and
+# back off harder each time one account is throttled.
+STAGGER = float(os.environ.get("BOOK_CACHE_STAGGER", "2.0"))
+HARD_PAUSE = {"A": 0.0, "B": 0.0}
+STRIKES = {"A": 0, "B": 0}
 UNITS = "/etc/systemd/system"
 TOKEN2_FILE = "/etc/involio-token2.env"
 ENGINE_PORTS = [8000, 8001, 8002, 8003, 8004, 8005, 8006]
@@ -97,11 +103,18 @@ def refresh_hot_set():
 def worker(token, jobs, label):
     """One Involio account: own pacing, own throttle state, own profile slice."""
     pace = PACE_FLOOR
+    with LOCK:
+        for _i, (_prof, _pid) in enumerate(jobs):
+            _ck = "%s|%s" % (_prof, _pid)
+            if not DUE.get(_ck):
+                DUE[_ck] = time.time() + _i * STAGGER
     while True:
         did = False
         for profile, pid in jobs:
             ck = "%s|%s" % (profile, pid)
             if COOLDOWN_UNTIL.get(ck, 0) > time.time():
+                continue
+            if HARD_PAUSE.get(label, 0) > time.time():
                 continue
             with LOCK:
                 if time.time() < DUE.get(ck, 0):
@@ -116,6 +129,7 @@ def worker(token, jobs, label):
                     CACHE[ck] = {"book": book, "ts": time.time(), "error": None, "token": label,
                                  "profile": profile, "pid": pid}
                 STATS["fetches"] += 1
+                STRIKES[label] = 0
                 interval = HOT_INTERVAL if profile in HOT else COLD_INTERVAL
                 with LOCK:
                     DUE[ck] = time.time() + interval
@@ -129,8 +143,13 @@ def worker(token, jobs, label):
                     DUE[ck] = time.time() + 20
                 STATS["errors"] += 1
                 if "429" in msg:
-                    COOLDOWN_UNTIL[ck] = time.time() + COOLDOWN
+                    STRIKES[label] = STRIKES.get(label, 0) + 1
+                    backoff = min(COOLDOWN * (2 ** (STRIKES[label] - 1)), 1800)
+                    COOLDOWN_UNTIL[ck] = time.time() + backoff
                     pace = min(pace * 1.3, 5.0)
+                    if STRIKES[label] >= 3:
+                        HARD_PAUSE[label] = time.time() + 120
+                        STRIKES[label] = 0
         if not did:
             time.sleep(1.5)
         else:

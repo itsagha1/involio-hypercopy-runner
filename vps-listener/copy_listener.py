@@ -467,56 +467,70 @@ def sync_size(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Op
 
 
 FEE_BUFFER = 0.0012
+from safe_tp import compute_safe_tp, describe as describe_safe_tp  # noqa: E402
 
 
-def _safe_copy_targets(client, rec, sl, tp):
-    """Owner 2026-11-11: same guard the main account has had since the WLD loss.
-    A source take-profit can sit on the losing side of OUR fill when our average
-    entry is worse than the source's (blocked adds). Copying that number turns a
-    profit target into a guaranteed loss order, so it is clamped to
-    breakeven+fees and never placed beyond the live price."""
-    side = rec.get("side")
-    entry = 0.0
+def _entry_price(client: BybitClient, rec: Dict[str, Any]) -> float:
+    """Our own average fill, from the exchange first, the record second."""
     try:
         for pos in client.get_positions(rec["symbol"]):
             if float(pos.get("size") or 0) > 0:
-                entry = float(pos.get("avgPrice") or 0)
-                break
+                return float(pos.get("avgPrice") or 0)
     except Exception:
-        entry = 0.0
-    if not entry:
-        try:
-            qty = float(rec.get("qty") or 0)
-            if qty:
-                entry = float(rec.get("notional") or 0) / qty
-        except Exception:
-            entry = 0.0
-    if entry and tp:
-        try:
-            be = entry * (1 + FEE_BUFFER) if side == "long" else entry * (1 - FEE_BUFFER)
-            tp = max(float(tp), be) if side == "long" else min(float(tp), be)
-        except Exception:
-            pass
-    return sl, tp
+        pass
+    try:
+        qty = float(rec.get("qty") or 0)
+        if qty:
+            return float(rec.get("notional") or 0) / qty
+    except Exception:
+        pass
+    return 0.0
 
 
 def sync_sltp(client: BybitClient, p: Dict[str, Any], rec: Dict[str, Any]) -> Optional[str]:
+    """Copy the source's SL/TP, but never as a loss order.
+
+    Owner rule (SAFE-TP): a take-profit below our own breakeven is raised to
+    breakeven plus fees; one that would fire the moment it lands is withheld.
+    The check now runs on EVERY poll against what is standing on the exchange,
+    not only when the source changes its numbers - a bad target placed earlier
+    must repair itself the moment this code is running.
+    """
     key = tkey(p)
-    sl, tp = p.get("stop_loss"), p.get("price_target")
-    if rec.get("stop_loss") == sl and rec.get("price_target") == tp and not rec.get("sltp_pending"):
-        return None
-    sl, tp = _safe_copy_targets(client, rec, sl, tp)
+    side = rec["side"]
+    src_sl, src_tp = p.get("stop_loss"), p.get("price_target")
+    entry = _entry_price(client, rec)
     try:
         price = float(client.get_ticker(rec["symbol"])["lastPrice"])
-        if sl and ((rec["side"] == "long" and float(sl) >= price) or (rec["side"] == "short" and float(sl) <= price)):
-            return None
-        if tp and ((rec["side"] == "long" and float(tp) <= price) or (rec["side"] == "short" and float(tp) >= price)):
-            return None
-        client.set_sl_tp(rec["symbol"], sl, tp, position_idx=position_idx(rec["symbol"], rec["side"]))
-        rec["stop_loss"] = sl
-        rec["price_target"] = tp
+    except Exception:
+        price = 0.0
+
+    tp, state = compute_safe_tp(side, entry, src_tp, price)
+
+    sl = src_sl
+    if sl and price:
+        try:
+            if (side == "long" and float(sl) >= price) or (side == "short" and float(sl) <= price):
+                sl = rec.get("stop_loss")          # refuse a stop that would fire instantly
+        except (TypeError, ValueError):
+            sl = rec.get("stop_loss")
+
+    changed = (rec.get("stop_loss") != sl) or (rec.get("price_target") != tp)
+    if not changed and not rec.get("sltp_pending"):
+        return None
+
+    note = describe_safe_tp(key, side, entry, src_tp, price)
+    try:
+        if state in ("none", "withheld") and rec.get("price_target"):
+            # nothing safe to place: clear any standing target so it cannot fire as a loss
+            client.set_sl_tp(rec["symbol"], sl, 0, position_idx=position_idx(rec["symbol"], side))
+            rec["stop_loss"], rec["price_target"] = sl, None
+            rec.pop("sltp_pending", None)
+            return (note or f"SAFE-TP {key}: take-profit cleared") + f" | sl={sl} tp cleared"
+        client.set_sl_tp(rec["symbol"], sl, tp, position_idx=position_idx(rec["symbol"], side))
+        rec["stop_loss"], rec["price_target"] = sl, tp
         rec.pop("sltp_pending", None)
-        return f"SYNC {key} SL/TP: sl={sl} tp={tp}"
+        return (note + " | " if note else "") + f"SYNC {key} SL/TP: sl={sl} tp={tp}"
     except BybitError as e:
         return f"ERROR {key} sync_sltp: {e}"
 
@@ -811,12 +825,15 @@ def poll_once() -> None:
     # --- owner 2026-10-21: margin monitor: instant 70% WhatsApp alert + entry hold ---
     try:
         if not (DRY_RUN or not client.configured):
-            from margin_alert import check as _margin_check, margin_pct as _margin_pct
+            from margin_alert import check as _margin_check, exchange_margin as _exchange_margin
             _s = client.get_account_summary()
             _pos = [p for p in client.get_positions() if float(p.get("size") or 0) > 0]
             _wallet = float(_s.get("wallet_balance") or 0)
-            _pct, _used = _margin_pct(_wallet, _pos)
+            _pct, _used, _equity, _src = _exchange_margin(client, _wallet, _pos)
             state["margin_pct"] = round(_pct, 2)
+            state["margin_used"] = round(_used, 2)
+            state["equity"] = round(_equity, 2)
+            state["margin_rate_source"] = _src
             _margin_check(NAME, _wallet, _pos,
                           os.environ.get("WEBHOOK_SHARED_SECRET", ""), log_action)
             # owner 2026-10-28: no NEW entries while margin >= 70%; entries
@@ -1228,6 +1245,9 @@ def status():
             "portfolio_id": PORTFOLIO_ID, "dry_run": DRY_RUN, "armed": state.get("armed"),
             "mirror_stats": _ms, "cumulative_pnl": (_ms or {}).get("cumulative_pnl"),
             "margin_pct": state.get("margin_pct"), "margin_hold": state.get("margin_hold", False),
+            # owner 2026-11-12: exchange basis (initial margin over equity), never wallet
+            "equity": state.get("equity"), "margin_used": state.get("margin_used"),
+            "margin_rate_source": state.get("margin_rate_source"),
             # owner 2026-11-02: net capital in = equity - realised PnL (estimate; exact
             # transfer sums need Bybit asset-transfer permission which the keys lack).
             "invested_usd": (_exact_invested(NAME) if _exact_invested(NAME) is not None else round(float(wallet or 0) - float((_ms or {}).get("cumulative_pnl") or 0), 2)),

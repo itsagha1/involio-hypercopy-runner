@@ -1758,6 +1758,7 @@ def health():
                       "margin_balance":account.get("margin_balance"),"unrealised_pnl":account.get("unrealised_pnl")},
             "cutover_armed":state.get("cutover_armed",False),"hold_new":state.get("hold_new",True),
             "margin_pct":ACCOUNT_CACHE.get("margin_pct"),"margin_hold":state.get("margin_hold",False),
+            "equity":ACCOUNT_CACHE.get("equity"),"margin_rate_source":ACCOUNT_CACHE.get("margin_rate_source"),
             "baseline_count":len(state.get("baseline",[])),"baseline_positions":len(state.get("baseline",[])),
             "mirrored":state.get("mirrored",{}),"manual":state.get("manual",[]),"orphans":state.get("orphans",{}),"mismatches":state.get("mismatches",{}),
             "retained":[{"key":k,"symbol":r.get("symbol"),"side":r.get("side"),"qty":r.get("qty"),"status":r.get("status"),
@@ -1929,6 +1930,9 @@ def _build_fleet_snapshot():
         # owner 2026-11-07: fall back to the bybit snapshot so main never shows a blank wallet.
         "wallet_balance": (main.get("wallet_balance") or (main.get("bybit") or {}).get("balance")),
         "available_balance": (main.get("available_balance") or (main.get("bybit") or {}).get("available")),
+        "margin_pct": main.get("margin_pct"), "equity": main.get("equity"),
+        "margin_used": (main.get("bybit") or {}).get("margin_used"),
+        "margin_rate_source": main.get("margin_rate_source"),
         "mirrored": main.get("mirrored", {}), "retained": main.get("retained", []),
         "manual": main.get("manual", []),
         "skip_watch_count": len(main.get("skip_watch", {}) or {}) if isinstance(main.get("skip_watch"), dict) else 0,
@@ -1973,6 +1977,8 @@ def _build_fleet_snapshot():
                 "version": d.get("code_version"), "ok": True,
                 "errors_last_run": d.get("errors_last_run", 0),
                 "wallet_balance": d.get("wallet"),
+                "margin_pct": d.get("margin_pct"), "equity": d.get("equity"),
+                "margin_used": d.get("margin_used"), "margin_rate_source": d.get("margin_rate_source"),
                 "available_balance": d.get("wallet_available", d.get("available_balance")),
                 "mirrored": mirrored, "retained": retained,
                 "manual": d.get("manual", []),
@@ -2008,8 +2014,21 @@ def _build_fleet_snapshot():
     for _acc in accounts:
         if isinstance(_acc, dict) and _acc.get("id") and _acc.get("ok") and not _acc.get("stale"):
             _LAST_GOOD_ACCOUNTS[_acc.get("id")] = _acc
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    fleet_used = sum(_num(a.get("margin_used")) for a in accounts)
+    fleet_equity = sum(_num(a.get("equity")) for a in accounts)
+    fleet_wallet = sum(_num(a.get("wallet_balance")) for a in accounts)
     return {"ok": all(a.get("ok") for a in accounts), "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "accounts": accounts}
+            "accounts": accounts,
+            # owner 2026-11-12: fleet risk on EQUITY, the same basis Bybit uses.
+            "fleet_margin_used": round(fleet_used, 2),
+            "fleet_equity": round(fleet_equity, 2),
+            "fleet_wallet": round(fleet_wallet, 2),
+            "fleet_used_pct": round(100.0 * fleet_used / fleet_equity, 2) if fleet_equity else None}
 
 def _main_self_poll_loop():
     # Owner 2026-10-28: near-realtime source monitoring. Fetches every authorized
@@ -2908,7 +2927,10 @@ def risk_tick():
             _w = _acct.get("wallet_balance")
             if _w and time.time() - (ACCOUNT_CACHE.get("ok_ts") or 0) < 300:
                 _pos = ACCOUNT_CACHE.get("positions") or []
-                ACCOUNT_CACHE["margin_pct"] = round(_ma.margin_pct(float(_w), _pos)[0], 2)
+                _pct, _used, _equity, _src = _ma.exchange_margin(client, float(_w), _pos)
+                ACCOUNT_CACHE["margin_pct"] = round(_pct, 2)
+                ACCOUNT_CACHE["equity"] = round(_equity, 2)
+                ACCOUNT_CACHE["margin_rate_source"] = _src
                 _ma.check("main", float(_w), _pos,
                           os.environ.get("WEBHOOK_SHARED_SECRET", ""), log_action)
         except Exception:

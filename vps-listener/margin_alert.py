@@ -31,6 +31,27 @@ def margin_pct(wallet, positions):
     return 100.0 * used / float(wallet), used
 
 
+def exchange_margin(client, wallet, positions):
+    """The exchange's own initial-margin rate: initial margin over EQUITY.
+
+    Owner 2026-11-12. The engines divided initial margin by WALLET, so any
+    account holding open losses showed a smaller, flattering number: AI Main
+    read 27% here while Bybit showed 33.87%. Display, alerts and the 70% entry
+    hold must all use the exchange rate, with the old figure only as a fallback
+    when the endpoint cannot be read.
+    """
+    try:
+        r = client._get('/v5/account/wallet-balance', {'accountType': 'UNIFIED'})
+        x = (r.get('list') or [{}])[0]
+        rate = x.get('accountIMRate')
+        im = x.get('totalInitialMargin')
+        if rate is not None and im is not None:
+            return float(rate) * 100.0, float(im), float(x.get('totalEquity') or 0), 'exchange'
+    except Exception:
+        pass
+    pct, used = margin_pct(wallet, positions)
+    return pct, used, float(wallet or 0), 'wallet_fallback'
+
 def check(account, wallet, positions, secret, log=print):
     """Returns the used-pct when an alert fired this call, else None."""
     now = time.time()
