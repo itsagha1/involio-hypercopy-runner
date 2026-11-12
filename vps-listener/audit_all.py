@@ -113,6 +113,22 @@ for name, port, _state in ENGINES:
         continue
     if d.get("errors_last_run"):
         finding("warning", name, "%s error(s) in the last poll" % d["errors_last_run"])
+    # margin judged on EQUITY from the exchange, never the engine's wallet figure
+    try:
+        import move_funds as _mf
+        _r = _mf.client_for(name)._get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        _x = (_r.get("list") or [{}])[0]
+        _rate = float(_x.get("accountIMRate") or 0) * 100.0
+        _free = float(_x.get("totalAvailableBalance") or 0)
+        engine_status.setdefault(name, {})["im_rate"] = round(_rate, 2)
+        if _rate >= 95:
+            finding("critical", name, "IM rate %.2f%% against equity, free %.2f - liquidation risk NOW" % (_rate, _free))
+        elif _rate >= 90:
+            finding("critical", name, "IM rate %.2f%% against equity - margin guard should borrow" % _rate)
+        elif _rate >= 85:
+            finding("warning", name, "IM rate %.2f%% against equity, free %.2f - approaching the 90%% trigger" % (_rate, _free))
+    except Exception as _me:
+        finding("info", name, "equity margin unreadable (%s)" % str(_me)[:50])
     lp = d.get("last_poll")
     if lp:
         try:
