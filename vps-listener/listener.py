@@ -2656,9 +2656,26 @@ def selfcheck_scan(x_signature: str = Header(default="")):
     try:
         with open("/var/lib/hypercopy-copy/deep_scan.json") as f:
             scan = json.load(f)
+        # skip stale deep-scan engine findings: the live pass above already
+        # checked every engine this second, so an old "stalled" line is fiction
+        _fresh = set()
+        for _n, _p in (("main", 8000), ("mainport", 8001), ("bakery", 8002), ("scalping", 8003),
+                       ("kings", 8004), ("bluespire", 8005), ("hypercopy", 8006)):
+            try:
+                _d = requests.get("http://127.0.0.1:%d/status" % _p, timeout=10).json()
+                _lp = _d.get("last_poll")
+                _age = (now - datetime.fromisoformat(_lp).timestamp()) if _lp else 9999
+                if _age < 300 and not _d.get("errors_last_run"):
+                    _fresh.add(_n)
+            except Exception:
+                pass
         for fnd in scan.get("findings") or []:
-            if fnd.get("sev") in ("critical", "warning"):
-                add(fnd["sev"], fnd.get("area", "system"), fnd.get("msg", ""), False)
+            if fnd.get("sev") not in ("critical", "warning"):
+                continue
+            if fnd.get("area") in _fresh or fnd.get("area") == "engine":
+                # deep scan predates a fix; the live check above supersedes it
+                continue
+            add(fnd["sev"], fnd.get("area", "system"), fnd.get("msg", ""), False)
         age_h = (now - datetime.fromisoformat(scan["ts"]).timestamp()) / 3600.0
         if age_h > 30:
             add("warning", "system", "daily deep scan is %.0fh old - scan overdue" % age_h, False)

@@ -5,7 +5,8 @@ A trade the HOME account cannot take (sub-minimum notional, symbol conflict,
 margin hold, 20% entry cap) is opened on the best other account instead.
 
 Owner's policy:
-  * spill source homes: bakery and scalping only (v1)
+  * spill sources: every account (owner 2026-11-12); targets: the five
+    subaccounts, never AI Main or hypercopy
   * size FITS THE TARGET WALLET, not the source size
   * pick the best target: lowest margin usage that still fills the minimum
   * the trade belongs to the TARGET account (it is recorded there as
@@ -37,9 +38,17 @@ ACCOUNTS = {
     "bluespire": 8005,
 }
 HOMES = ("bakery", "scalping")
+# Owner 2026-11-12: spillover covers every source account, not just bakery and
+# scalping. Targets stay the five subaccounts in ACCOUNTS - AI Main and hypercopy
+# are deliberately never used as targets.
 LOG_FILES = {
+    "main": "/home/ubuntu/involio-hypercopy-runner/vps-listener/actions.log",
+    "mainport": "/var/lib/hypercopy-copy/mainport_actions.log",
     "bakery": "/var/lib/hypercopy-copy/bakery_actions.log",
     "scalping": "/var/lib/hypercopy-copy/scalping_actions.log",
+    "kings": "/var/lib/hypercopy-copy/kings_actions.log",
+    "bluespire": "/var/lib/hypercopy-copy/bluespire_actions.log",
+    "hypercopy": "/var/lib/hypercopy-copy/hypercopy_actions.log",
 }
 
 MIN_NOTIONAL = 5.0
@@ -165,7 +174,7 @@ def candidates(state):
         except OSError:
             continue
         for line in lines:
-            m = re.match(r"\[(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d) UTC\] \S+: SKIP (\S+) (new_entry): (.+)", line)
+            m = re.match(r"\[(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)(?:\+00:00| UTC)\] (?:\S+: )?SKIP (\S+) (new_entry): (.+)", line)
             if not m:
                 continue
             when = datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
